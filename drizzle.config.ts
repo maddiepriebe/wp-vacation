@@ -1,4 +1,8 @@
 import { defineConfig } from "drizzle-kit";
+import { config } from "dotenv";
+
+// Load env vars from .env.local (drizzle-kit doesn't do this automatically).
+config({ path: ".env.local" });
 
 // `generate` doesn't need a connection; only `migrate`/`push`/`studio` do.
 // We let the URL fall back to empty so generate works offline, and drizzle-kit
