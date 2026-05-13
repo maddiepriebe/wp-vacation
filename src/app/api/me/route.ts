@@ -6,6 +6,12 @@ export async function GET() {
   if (!user) {
     return NextResponse.json({ user: null }, { status: 401 });
   }
+  if (user.kind === "orphaned") {
+    return NextResponse.json(
+      { kind: "orphaned", clerkUserId: user.clerkUserId },
+      { status: 403 },
+    );
+  }
   if (user.kind === "admin") {
     return NextResponse.json({
       kind: "admin",

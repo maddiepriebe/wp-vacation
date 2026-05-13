@@ -10,9 +10,17 @@ import type { Admin, Employee } from "@/db/schema";
 // `[[...sign-up]]`). typedRoutes doesn't emit the bare paths in its Route
 // union, so we cast at the call sites. See docs/CLAUDE.md.
 
+// Three distinct auth states, deliberately not collapsed:
+//   - null              → no Clerk session. Send to /sign-in.
+//   - "orphaned"        → has a Clerk session but no matching DB row.
+//                         Send to /account/unlinked (never to /sign-in,
+//                         which would loop because Clerk would auto-redirect
+//                         the already-authenticated user back here).
+//   - "admin"/"employee"→ resolved to a real DB row.
 export type CurrentUser =
   | { kind: "employee"; employee: Employee }
   | { kind: "admin"; admin: Admin }
+  | { kind: "orphaned"; clerkUserId: string }
   | null;
 
 export async function getCurrentUser(): Promise<CurrentUser> {
@@ -33,12 +41,13 @@ export async function getCurrentUser(): Promise<CurrentUser> {
     .limit(1);
   if (employee) return { kind: "employee", employee };
 
-  return null;
+  return { kind: "orphaned", clerkUserId: userId };
 }
 
 export async function requireEmployee(): Promise<Employee> {
   const user = await getCurrentUser();
   if (!user) redirect("/sign-in" as Route);
+  if (user.kind === "orphaned") redirect("/account/unlinked");
   if (user.kind !== "employee") redirect("/admin");
   return user.employee;
 }
@@ -46,6 +55,7 @@ export async function requireEmployee(): Promise<Employee> {
 export async function requireAdmin(): Promise<Admin> {
   const user = await getCurrentUser();
   if (!user) redirect("/sign-in" as Route);
+  if (user.kind === "orphaned") redirect("/account/unlinked");
   if (user.kind !== "admin") redirect("/dashboard");
   return user.admin;
 }

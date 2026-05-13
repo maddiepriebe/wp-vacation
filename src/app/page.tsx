@@ -7,6 +7,7 @@ export default async function RootPage() {
   // `/sign-in` is a Clerk catch-all (`[[...sign-in]]`) — typedRoutes doesn't
   // emit the bare path in its Route union, so we cast. See docs/CLAUDE.md.
   if (!user) redirect("/sign-in" as Route);
+  if (user.kind === "orphaned") redirect("/account/unlinked");
   if (user.kind === "admin") redirect("/admin");
   redirect("/dashboard");
 }

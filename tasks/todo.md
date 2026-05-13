@@ -113,6 +113,7 @@ End-to-end walk, in this order:
   - returns 200 with `{ deleted: <clerkUserId> }`
   - the Clerk user is gone from the Clerk dashboard
   - no orphan rows in DB
+- [ ] **Orphan flow check.** Manually create a Clerk user via the Clerk dashboard (bypasses the webhook delete). Sign in with that user. Expect to land on `/account/unlinked` with a Sign out button — **not** a redirect loop between `/` and `/sign-in`. Sign out from the page; verify a clean return to `/sign-in`. Then delete the Clerk user manually.
 
 ---
 
