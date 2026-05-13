@@ -3,9 +3,10 @@ import { withSentryConfig } from "@sentry/nextjs";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  experimental: {
-    typedRoutes: true,
-  },
+  // typedRoutes was tried but conflicts with Clerk's optional catch-all
+  // `/sign-in/[[...sign-in]]` — Next's generated union doesn't include the
+  // bare `/sign-in` path, so redirect("/sign-in") fails type checking.
+  // Not worth working around for the type-safety gain.
 };
 
 const sentryEnabled = !!process.env.SENTRY_DSN;
