@@ -29,6 +29,17 @@ A week's schedule = templates resolved for that week, minus any concrete shifts 
 ### Admin lifecycle: hard-coded seed only in v1
 Three admins are created by the seed script. No add-admin UI in v1.
 
+### Routing: cast Clerk catch-all paths to `Route`
+`next.config.ts` enables `typedRoutes: true`. Clerk's auth pages live at `/sign-in/[[...sign-in]]/page.tsx` and `/sign-up/[[...sign-up]]/page.tsx`. The optional catch-all means the bare paths `/sign-in` and `/sign-up` are valid at runtime but **not** emitted in the generated `Route` union. Anywhere you redirect or link to those paths, cast the literal — otherwise the build fails type-checking:
+
+```ts
+import type { Route } from "next";
+redirect("/sign-in" as Route);
+<Link href={"/sign-up" as Route}>Create account</Link>
+```
+
+Static routes (`/admin`, `/dashboard`, etc.) don't need the cast. Clerk's own props like `<UserButton afterSignOutUrl="/sign-in" />` take plain `string` and also don't need the cast.
+
 ### v1 behavior pinned (resolves PRD open questions)
 - **Personal/sick:** 4 days at 90 days + 5 more at 6 months → 9 days/year flat. No tenure growth.
 - **Vacation under 6 months:** 0 hours.

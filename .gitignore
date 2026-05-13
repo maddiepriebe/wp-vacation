@@ -55,3 +55,6 @@ yarn-error.log*
 
 # pwa generated icons
 /public/icons/.cache/
+
+# Claude Code local settings
+/.claude/settings.local.json

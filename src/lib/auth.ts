@@ -1,9 +1,14 @@
+import type { Route } from "next";
 import { auth, currentUser } from "@clerk/nextjs/server";
 import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
 import { db } from "@/db/client";
 import { admins, employees } from "@/db/schema";
 import type { Admin, Employee } from "@/db/schema";
+
+// `/sign-in` and `/sign-up` are Clerk catch-all routes (`[[...sign-in]]`,
+// `[[...sign-up]]`). typedRoutes doesn't emit the bare paths in its Route
+// union, so we cast at the call sites. See docs/CLAUDE.md.
 
 export type CurrentUser =
   | { kind: "employee"; employee: Employee }
@@ -33,14 +38,14 @@ export async function getCurrentUser(): Promise<CurrentUser> {
 
 export async function requireEmployee(): Promise<Employee> {
   const user = await getCurrentUser();
-  if (!user) redirect("/sign-in");
+  if (!user) redirect("/sign-in" as Route);
   if (user.kind !== "employee") redirect("/admin");
   return user.employee;
 }
 
 export async function requireAdmin(): Promise<Admin> {
   const user = await getCurrentUser();
-  if (!user) redirect("/sign-in");
+  if (!user) redirect("/sign-in" as Route);
   if (user.kind !== "admin") redirect("/dashboard");
   return user.admin;
 }
