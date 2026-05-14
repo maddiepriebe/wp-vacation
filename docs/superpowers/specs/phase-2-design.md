@@ -34,7 +34,7 @@ These supersede the corresponding entries in `docs/PRD.md` for Phase 2 build pur
 6. **Clerk invite precondition:** `sendInviteAction` requires an existing employee (or admin) row with `clerk_user_id IS NULL`. Fails fast if the row is missing or already linked. The webhook handler in Phase 1 handles the inbound link-back.
 7. **Resolver caching:** `resolveWeek` is wrapped in `React.cache()` for per-request memoization across Server Components. No `unstable_cache` — invalidation isn't worth the complexity at this scale.
 8. **Resolver shape:** plain async function imported from Server Components and Server Actions. No `'use server'` directive. Reads don't need it, and decorating it would force every caller through the Server Action protocol unnecessarily.
-9. **Vacation and sick balances are tenure-derived from `hire_date`.** Computed via `src/lib/balances/entitlements.ts`. They are *not* importable spreadsheet columns. Prior-system usage in the current anniversary year is captured separately via the historical-usage entry on the employee profile (§3.6). Unpaid is the only balance bucket admitted from the spreadsheet.
+9. **Vacation and personal balances are tenure-derived from `anniversary_date`.** Computed via `src/lib/balances/entitlements.ts`. They are *not* importable spreadsheet columns. Prior-system usage in the current anniversary year is captured separately via the historical-usage entry on the employee profile (§3.6). Phase 1 names the bucket `personal` as the umbrella term for sick/personal time per `docs/CLAUDE.md` v1 pinning; there is no separate `unpaid` balance bucket. Phase 2 reuses Phase 1's `balance_kind` / `delta_hours` / `anniversary_date` field names verbatim — no schema renames.
 
 ---
 
@@ -47,7 +47,7 @@ New code mirrors the Phase 1 conventions: `(admin)` route group for admin pages,
 - `src/lib/dates.ts` — central date utilities. Exports `weekStart(date)` (Monday 00:00 ET), `weekEnd(date)`, `toEtDate(utc)`, `fromEtDate(local)`, `isSameWeek(a, b)`, `daysInRange(start, end)`, plus validation helpers `isISODateString`, `isMondayISODate`, `timeToMinutes`, `assertTimeRange`. Used by the resolver, save-as-template, copy-week, Phase 5 cron jobs, and every Zod schema that touches dates or times.
 - `src/lib/actions/errors.ts` — `ActionError` and `ActionResult<T>` types. Single source of truth for the Server Action error envelope (§5.1).
 - `src/lib/actions/transactions.ts` — `runActionTx` wrapper, `txStorage` (AsyncLocalStorage), `IntentionalRollback` sentinel, `dbOrTx()` helper, `sanitizeContext` for internal-error logging. Centralizes the commit / rollback / sanitized-log contract for every mutating action (§7.1).
-- `src/lib/balances/entitlements.ts` — `computeVacationEntitlement(hireDate, asOf)` and `computeSickEntitlement(hireDate, asOf)`. Tenure-derived formulas, single source of truth used by §3 onboarding and the Phase 5 anniversary cron.
+- `src/lib/balances/entitlements.ts` — `computeVacationEntitlement(anniversaryDate, asOf)` and `computePersonalEntitlement(anniversaryDate, asOf)`. Tenure-derived formulas (Phase 1's `personal` bucket is the umbrella for sick/personal time per `docs/CLAUDE.md`). Single source of truth used by §3 onboarding and the Phase 5 anniversary cron.
 - `src/lib/employees/normalize.ts` — `normalizeEmail(email)`. Called inside Zod transforms; action bodies do not re-normalize.
 - `src/lib/employees/schemas.ts` — Zod schemas: `employeeInputSchema` (manual add) and `employeeImportRowSchema` (spreadsheet rows). Shared row-level validation across §3.
 - `src/lib/schedule/types.ts` — `ShiftSource`, `ScheduleMode`, `ResolvedShift` (discriminated union for `template` / `override` variants), plus `ShiftLike` / `TemplateLike` shapes consumed by the conflict detector.
@@ -94,7 +94,7 @@ Client-side, persisted in `sessionStorage` keyed by upload session id. A mid-flo
 - `src/test/fixtures.ts` — `makeClass`, `makeEmployee`, `makeTemplate`, `makeShift`, etc. All take `tx`; generate globally unique defaults to avoid unique-constraint collisions in parallel test runs.
 - `src/test/check-schema.ts` — pre-test schema/version check; fails fast if `__drizzle_migrations` doesn't match the highest file in `drizzle/`.
 - `lib/dates/__tests__/dates.test.ts` — week boundaries across DST transitions; `isISODateString` / `isMondayISODate` / time helpers.
-- `lib/balances/__tests__/entitlements.test.ts` — vacation/sick tenure formulas across boundary dates.
+- `lib/balances/__tests__/entitlements.test.ts` — vacation/personal tenure formulas across boundary dates.
 - `lib/schedule/__tests__/resolver.test.ts`, `conflicts.test.ts` — fixture-driven; `conflicts` is pure unit, `resolver` is integration via `withTx`. See §4.8 / §5.7.
 - `lib/sheets/__tests__/employee-import.test.ts`, `enrollment-import.test.ts` — fixture sheets for the happy path and each row-level error.
 - Server Action integration tests live next to the action (`src/app/(admin)/**/__tests__/*.test.ts`) and run inside `withTx` + `runActionTx` savepoint join. No mocks; no separate test project.
@@ -211,7 +211,7 @@ Manual add and import both check collisions on `LOWER(email)` (§3.2 step 4). If
 
 ### Modified: `balance_transaction`
 
-Add `'historical_usage'` to the `balance_source` enum. Used by §3.6 to record vacation/sick days drawn in a prior system before the employee was onboarded into wp-vacation.
+Add `'historical_usage'` to the `balance_source` enum. Used by §3.6 to record vacation/personal days drawn in a prior system before the employee was onboarded into wp-vacation.
 
 ```sql
 ALTER TYPE balance_source ADD VALUE 'historical_usage';
@@ -260,14 +260,14 @@ These weren't needed in Phase 1 (tables empty). Added in migration #2 ahead of P
 
 ## Section 3 — Onboarding pipeline
 
-Three entry points: manual single-employee form, bulk spreadsheet upload, and an admin-triggered Clerk invite issued from the profile page after the row exists. Plus a historical-usage tool for capturing prior-system vacation/sick draws. All live under `src/app/(admin)/admin/employees/` and share row-level validation via Zod schemas in `src/lib/employees/schemas.ts`.
+Three entry points: manual single-employee form, bulk spreadsheet upload, and an admin-triggered Clerk invite issued from the profile page after the row exists. Plus a historical-usage tool for capturing prior-system vacation/personal draws. All live under `src/app/(admin)/admin/employees/` and share row-level validation via Zod schemas in `src/lib/employees/schemas.ts`.
 
 ### 3.1 Shared validation
 
 `src/lib/employees/schemas.ts` exports two Zod schemas, single source of truth for row-level rules.
 
-- `employeeInputSchema` (manual form): required `first_name`, `last_name`, `email`, `role`, `default_class_id`, `hire_date`. No balance fields — vacation and sick are derived from `hire_date`; unpaid starts at 0.
-- `employeeImportRowSchema` (spreadsheet rows): superset of the form schema, replaces `default_class_id` with `default_class_name` (case-insensitive **exact** match against `class.name` — no fuzzy matching), adds `current_unpaid_hours_remaining` (numeric, default 0). No vacation or sick columns; those are computed.
+- `employeeInputSchema` (manual form): required `first_name`, `last_name`, `email`, `role_in_class` (`'teacher' | 'assistant_teacher'` per Phase 1 enum), `default_class_id`, `anniversary_date`, `scheduled_hours_per_week`. Optional: `phone`. No balance fields — vacation and personal are derived from `anniversary_date`.
+- `employeeImportRowSchema` (spreadsheet rows): superset of the form schema, replaces `default_class_id` with `default_class_name` (case-insensitive **exact** match against `class.name` — no fuzzy matching). No balance columns at all — both buckets are computed from `anniversary_date`.
 
 Both schemas normalize email to lowercase before storage.
 
@@ -282,7 +282,7 @@ Action runs in a single Drizzle transaction:
 3. Verify `default_class_id` exists in `class`.
 4. Check `email` collision — unique on `LOWER(email)`.
 5. Insert `employee` with `clerk_user_id = NULL`, all `*_hours_balance` = 0 initially.
-6. Compute `vacationHours = computeVacationEntitlement(hire_date, today)` and `sickHours = computeSickEntitlement(hire_date, today)` from `src/lib/balances/entitlements.ts`. For each non-zero result, write `balance_transaction(source='initial_import', type, delta=hours, occurred_at=now)` and set the corresponding denormalized column.
+6. Compute `vacationHours = computeVacationEntitlement(anniversary_date, today)` and `personalHours = computePersonalEntitlement(anniversary_date, today)` from `src/lib/balances/entitlements.ts`. For each non-zero result, write `balance_transaction(source='initial_import', balance_kind, delta_hours)` and set the corresponding denormalized column (`employee.vacation_hours_balance` or `employee.personal_hours_balance`).
 7. Write one `audit_log` row: `action = 'employee.create'`, payload = validated input.
 8. `revalidatePath('/admin/employees')`, return `{ ok: true, id }`.
 
@@ -328,9 +328,10 @@ On any failure, full transaction rollback. The `sessionStorage` entry survives s
 
 For each newly-inserted employee (both manual and import paths), inside the same transaction as the `employee` insert:
 
-- **Vacation:** `vacationHours = computeVacationEntitlement(hire_date, today)`. If non-zero, write `balance_transaction(source='initial_import', type='vacation', delta=vacationHours, occurred_at=now, note='Initial entitlement on onboarding')` and set `employee.vacation_hours_balance = vacationHours`.
-- **Sick:** same shape, using `computeSickEntitlement(hire_date, today)`.
-- **Unpaid:** import path uses the spreadsheet's `current_unpaid_hours_remaining` (default 0); manual path uses 0. If non-zero, write `balance_transaction(source='initial_import', type='unpaid', delta=hours, occurred_at=now, note='Initial unpaid balance from import')` and set `employee.unpaid_hours_balance`.
+- **Vacation:** `vacationHours = computeVacationEntitlement(anniversary_date, today)`. If non-zero, write `balance_transaction(source='initial_import', balance_kind='vacation', delta_hours=vacationHours, note='Initial entitlement on onboarding')` and set `employee.vacation_hours_balance = vacationHours`.
+- **Personal:** same shape, using `computePersonalEntitlement(anniversary_date, today)`, `balance_kind='personal'`, writing to `employee.personal_hours_balance`.
+
+(No `unpaid` balance bucket exists in Phase 1 / Phase 2 — `personal` covers sick/personal time per `docs/CLAUDE.md` v1 pinning.)
 
 **Invariant:** `employee.<type>_hours_balance = SUM(balance_transaction.delta WHERE employee_id = E AND type = T)` always holds. Phase 3 maintains it on approve/withdraw; Phase 5 anniversary cron maintains it on annual reset. Onboarding writes both halves in the same transaction.
 
@@ -360,24 +361,24 @@ The Phase 1 Clerk webhook handler completes the link by setting `clerk_user_id` 
 
 ### 3.6 Historical usage entry
 
-Admin tool for recording vacation or sick days used in a prior system. Needed because vacation and sick are granted at full entitlement on onboarding; prior-period draws aren't otherwise represented.
+Admin tool for recording vacation or personal days used in a prior system. Needed because both buckets are granted at full entitlement on onboarding; prior-period draws aren't otherwise represented.
 
 Surface: `employees/[id]/page.tsx`, "Record previously used time off" button opens `HistoricalUsageDialog` (Client Component).
 
 Form fields:
 
-- Type — `vacation | sick` (radio).
+- Balance kind — `vacation | personal` (radio).
 - Start date, end date (date pickers).
 - Optional note.
 
-`recordHistoricalUsageAction({ employeeId, type, startDate, endDate, note })`:
+`recordHistoricalUsageAction({ employeeId, balanceKind, startDate, endDate, note })`:
 
 1. Auth: admin only.
-2. Validate: `startDate <= endDate`; both dates fall within the employee's current anniversary year for the given `type`. Out-of-range entries are rejected — they wouldn't affect today's balance anyway (prior anniversary year's grant is gone).
+2. Validate: `startDate <= endDate`; both dates fall within the employee's current anniversary year for the given `balanceKind`. Out-of-range entries are rejected — they wouldn't affect today's balance anyway (prior anniversary year's grant is gone).
 3. Compute hours: count weekdays (M–F) in `[startDate, endDate]` × 8 hrs/day. The 8-hr default is the Phase 2 v1 assumption — there is no `default_hours_per_day` field on `employee` in Phase 1. If part-time hours per day are introduced later, this multiplier is replaced by `employee.default_hours_per_day`. Weekends excluded. Holidays are **not** excluded in v1 — admin shortens the range manually if a holiday falls in it.
-4. Write `balance_transaction(source='historical_usage', employee_id, type, delta=-hours, occurred_at=startDate, note)`.
-5. Decrement denormalized `employee.<type>_hours_balance` by `hours`. Invariant preserved (balance = SUM of deltas).
-6. Audit log: `action = 'employee.historical_usage_recorded'`, payload = `{ type, startDate, endDate, hours }`.
+4. Write `balance_transaction(source='historical_usage', employee_id, balance_kind, delta_hours=-hours, note=\`Historical usage ${startDate} to ${endDate}\`)`. Phase 1's `balance_transaction` has only `created_at` (auto-set to now); precise start/end dates live in the audit log payload (step 6) for forensic queries.
+5. Decrement denormalized `employee.<balance_kind>_hours_balance` by `hours`. Invariant preserved (balance = SUM of `delta_hours`).
+6. Audit log: `action = 'employee.historical_usage_recorded'`, payload = `{ balanceKind, startDate, endDate, hours }`.
 
 ### 3.7 Route summary
 
@@ -396,14 +397,14 @@ All gated by the `(admin)` layout's admin check (Phase 1 already enforces).
 Integration tests (`src/app/(admin)/admin/employees/__tests__/actions.test.ts`, transactional rollback via `withTx`):
 
 - `createEmployeeAction`: happy path; `validation` on bad email / missing required field; `class_missing`; `LOWER(email)` collision.
-- `createEmployeeAction`: vacation/sick rows written only when the tenure entitlement is non-zero; the denormalized balance matches the inserted `balance_transaction.delta`.
+- `createEmployeeAction`: vacation/personal rows written only when the tenure entitlement is non-zero; the denormalized balance matches the inserted `balance_transaction.delta_hours`.
 - `parseEmployeeImportAction`: happy path returns rows with `ok: true`; row-level errors for bad email / unknown `default_class_name` / duplicate emails within sheet; cross-row error count matches expectations.
 - `commitEmployeeImportAction`: happy path inserts N rows + balance transactions atomically; class deletion between preview and commit fails the whole transaction with `class_missing`.
 - `sendInviteAction`: happy path writes audit row with the Clerk invitation id; `not_found` for missing employee; `already_linked` when `clerk_user_id IS NOT NULL`; Clerk's "invitation already pending" maps to `invite_pending`.
 - `resendInviteAction`: happy path revokes the previous Clerk invitation then creates a new one; audit row written as `employee.invite_resent`.
 - `recordHistoricalUsageAction`: happy path writes a negative `balance_transaction(source='historical_usage')` and decrements the denormalized column; `validation` for `startDate > endDate`; `validation` for dates outside the current anniversary year; weekday-counting math matches expected hours for a range spanning a weekend.
 
-`lib/balances/__tests__/entitlements.test.ts` — pure unit tests for `computeVacationEntitlement` and `computeSickEntitlement` across boundary dates (under 90 days, exactly 90 days, just before/after 6 months, just before/after each anniversary).
+`lib/balances/__tests__/entitlements.test.ts` — pure unit tests for `computeVacationEntitlement` and `computePersonalEntitlement` across boundary dates (under 90 days, exactly 90 days, just before/after 6 months, just before/after each anniversary).
 
 ---
 
