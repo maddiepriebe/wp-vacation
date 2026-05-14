@@ -1,4 +1,4 @@
-import { db } from "@/db/client";
+import type { DB } from "@/db/client";
 import {
   classes,
   employees,
@@ -14,7 +14,7 @@ import {
   type ScheduleShiftTemplate,
 } from "@/db/schema";
 
-type DrizzleTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type DrizzleTx = Parameters<Parameters<DB["transaction"]>[0]>[0];
 
 function uniqueSuffix(): string {
   return crypto.randomUUID().slice(0, 8);
