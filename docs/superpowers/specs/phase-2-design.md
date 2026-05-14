@@ -1,6 +1,6 @@
 # Phase 2 — Setup & Schedule: Design
 
-**Status:** in progress, Sections 1–2 approved, Section 3 (onboarding pipeline) next.
+**Status:** all sections drafted (1–7); self-review applied; pending user review.
 
 **Phase goal (per PRD §10):** admin can onboard employees and build schedules.
 
@@ -44,15 +44,21 @@ New code mirrors the Phase 1 conventions: `(admin)` route group for admin pages,
 
 ### Domain logic — `src/lib/`
 
-- `src/lib/dates.ts` — central date utilities. Exports `weekStart(date)` (Monday 00:00 ET), `weekEnd(date)`, `toEtDate(utc)`, `fromEtDate(local)`, `isSameWeek(a, b)`, `daysInRange(start, end)`. Used by the resolver, save-as-template, copy-week, and Phase 5 cron jobs.
+- `src/lib/dates.ts` — central date utilities. Exports `weekStart(date)` (Monday 00:00 ET), `weekEnd(date)`, `toEtDate(utc)`, `fromEtDate(local)`, `isSameWeek(a, b)`, `daysInRange(start, end)`, plus validation helpers `isISODateString`, `isMondayISODate`, `timeToMinutes`, `assertTimeRange`. Used by the resolver, save-as-template, copy-week, Phase 5 cron jobs, and every Zod schema that touches dates or times.
+- `src/lib/actions/errors.ts` — `ActionError` and `ActionResult<T>` types. Single source of truth for the Server Action error envelope (§5.1).
+- `src/lib/actions/transactions.ts` — `runActionTx` wrapper, `txStorage` (AsyncLocalStorage), `IntentionalRollback` sentinel, `dbOrTx()` helper, `sanitizeContext` for internal-error logging. Centralizes the commit / rollback / sanitized-log contract for every mutating action (§7.1).
 - `src/lib/balances/entitlements.ts` — `computeVacationEntitlement(hireDate, asOf)` and `computeSickEntitlement(hireDate, asOf)`. Tenure-derived formulas, single source of truth used by §3 onboarding and the Phase 5 anniversary cron.
+- `src/lib/employees/normalize.ts` — `normalizeEmail(email)`. Called inside Zod transforms; action bodies do not re-normalize.
 - `src/lib/employees/schemas.ts` — Zod schemas: `employeeInputSchema` (manual add) and `employeeImportRowSchema` (spreadsheet rows). Shared row-level validation across §3.
-- `src/lib/schedule/resolver.ts` — `resolveWeek(classId, weekStart) → ResolvedShift[]`, plain async function wrapped in `React.cache()`. Returns shifts with `source: 'template' | 'override'` so the UI can style overrides distinctly.
-- `src/lib/schedule/conflicts.ts` — pure functions. `detectShiftConflicts(candidate, existing) → ConflictReason[]` implements the four overlap rules (a)/(b)/(c)/(d). No DB access; Server Actions fetch the relevant week's resolved shifts and pass them in.
+- `src/lib/schedule/types.ts` — `ShiftSource`, `ScheduleMode`, `ResolvedShift` (discriminated union for `template` / `override` variants), plus `ShiftLike` / `TemplateLike` shapes consumed by the conflict detector.
+- `src/lib/schedule/resolver.ts` — `resolveWeek(classId, weekStartISO)` and `resolveTemplateWeek(classId, weekStartISO)`, both wrapped in `React.cache()` and using `dbOrTx()` for tx-aware reads. Shared `expandTemplates` helper.
+- `src/lib/schedule/conflicts.ts` — pure `detectShiftConflicts(candidate, ctx) → ConflictReason[]` implementing rules (a)/(c)/(d). No DB access; Server Actions fetch context and pass it in.
+- `src/lib/schedule/schemas.ts` — Zod input schemas for every shift/template Server Action (create / update / delete / save-as-template / copy-week).
+- `src/lib/schedule/closure.ts` — `applyClosureRule(tx, classId, newEffectiveFromISO)`. Called only by `saveAsTemplateAction` (§6.1).
 - `src/lib/sheets/parse.ts` — thin SheetJS wrapper. `parseSheet(buffer, schema) → Row[]` returning typed rows or per-row errors.
-- `src/lib/sheets/employee-import.ts` — validator + commit for the employee sheet. Writes `employees`, `balance_transaction(source='initial_import')`, and sets denormalized `*_hours_balance`.
-- `src/lib/sheets/enrollment-import.ts` — validator + commit for the enrollment forecast sheet.
-- `src/lib/clerk-invite.ts` — wraps Clerk's Backend SDK `invitations.createInvitation()`. Normalizes Clerk's error shapes into the app's `ActionError` type and centralizes the redirect URL + email template config.
+- `src/lib/sheets/employee-import.ts` — validator + commit support for the employee sheet.
+- `src/lib/sheets/enrollment-import.ts` — validator + commit support for the per-class enrollment forecast sheet.
+- `src/lib/clerk-invite.ts` — exports `inviteUser` and `resendInvite`, thin wrappers around Clerk Backend SDK `invitations.createInvitation()` (and revoke + re-create for resend). Normalize Clerk's error shapes into the app's `ActionError` codes (specifically mapping "invitation already pending" → `code: 'invite_pending'`) and centralize `redirectUrl` + `notify: true` config.
 
 ### Schema — `src/db/schema/`
 
@@ -65,12 +71,14 @@ New code mirrors the Phase 1 conventions: `(admin)` route group for admin pages,
 
 - `employees/new/page.tsx` — manual add form.
 - `employees/upload/page.tsx` — three-step bulk upload (upload → preview → confirm).
-- `employees/[id]/page.tsx` — profile, with "Send invite" button gated on `clerk_user_id IS NULL`.
-- `employees/actions.ts` — `createEmployeeAction`, `commitEmployeeImportAction`, `sendInviteAction`.
-- `classes/[id]/schedule/page.tsx` — schedule grid. **Server Component**: calls `resolveWeek()`, serializes `ResolvedShift[]`, passes as props.
-- `classes/[id]/schedule/print/page.tsx` — print view route with `@media print` CSS.
-- `classes/[id]/schedule/_components/` — `WeekGrid`, `ShiftBlock`, `ShiftEditDialog`, `SaveAsTemplateDialog`, `CopyWeekDialog`, `WeekNavigator`, `ModeToggle` (at top level of the grid view), `EnrollmentRow`. All Client Components.
-- `classes/[id]/actions.ts` — `createShiftAction`, `updateShiftAction`, `deleteShiftAction`, `saveAsTemplateAction`, `copyWeekAction`, `upsertEnrollmentAction`, `commitEnrollmentImportAction`.
+- `employees/upload/preview/page.tsx` — preview step (reads `sessionStorage`).
+- `employees/[id]/page.tsx` — profile, with "Send invite" / "Resend invite" buttons (gated on `clerk_user_id`) and "Record previously used time off" affordance.
+- `employees/actions.ts` — `createEmployeeAction`, `parseEmployeeImportAction`, `commitEmployeeImportAction`, `sendInviteAction`, `resendInviteAction`, `recordHistoricalUsageAction`.
+- `classes/[id]/schedule/page.tsx` — schedule grid. **Server Component**: calls `resolveWeek()` or `resolveTemplateWeek()` per `mode`, passes `ResolvedShift[]` as props.
+- `classes/[id]/schedule/print/page.tsx` — print view route with `@media print` CSS and a manual `Print` button (no auto-trigger).
+- `classes/[id]/schedule/_components/` — `ScheduleClient` (top-level Client Component owning mode + week state), `WeekGrid`, `ShiftBlock`, `ShiftEditDialog`, `SaveAsTemplateDialog`, `CopyWeekDialog`, `HistoricalUsageDialog`, `WeekNavigator`, `ModeToggle`, `EnrollmentRow`, `ConflictModal`. All Client Components.
+- `classes/[id]/enrollment/upload/page.tsx` — per-class enrollment bulk upload (parse → preview → confirm).
+- `classes/[id]/actions.ts` — `createShiftAction`, `updateShiftAction`, `deleteShiftAction`, `createShiftTemplateAction`, `updateShiftTemplateAction`, `deleteShiftTemplateAction`, `saveAsTemplateAction`, `copyWeekAction`, `upsertEnrollmentForecastAction`, `deleteEnrollmentForecastAction`, `commitEnrollmentImportAction`.
 
 ### Server/client split for the schedule grid
 
@@ -82,10 +90,15 @@ Client-side, persisted in `sessionStorage` keyed by upload session id. A mid-flo
 
 ### Tests — `src/**/__tests__/`
 
-- `lib/dates/__tests__/dates.test.ts` — week boundaries across DST transitions.
-- `lib/schedule/__tests__/resolver.test.ts`, `conflicts.test.ts` — pure-function unit tests, fixture-driven.
+- `src/test/with-tx.ts` — `withTx` harness. Opens a Drizzle transaction, binds the test body to `txStorage` (ALS), rolls back at end. Server Actions invoked through `runActionTx` join as savepoints (§7.1 / §7.4).
+- `src/test/fixtures.ts` — `makeClass`, `makeEmployee`, `makeTemplate`, `makeShift`, etc. All take `tx`; generate globally unique defaults to avoid unique-constraint collisions in parallel test runs.
+- `src/test/check-schema.ts` — pre-test schema/version check; fails fast if `__drizzle_migrations` doesn't match the highest file in `drizzle/`.
+- `lib/dates/__tests__/dates.test.ts` — week boundaries across DST transitions; `isISODateString` / `isMondayISODate` / time helpers.
+- `lib/balances/__tests__/entitlements.test.ts` — vacation/sick tenure formulas across boundary dates.
+- `lib/schedule/__tests__/resolver.test.ts`, `conflicts.test.ts` — fixture-driven; `conflicts` is pure unit, `resolver` is integration via `withTx`. See §4.8 / §5.7.
 - `lib/sheets/__tests__/employee-import.test.ts`, `enrollment-import.test.ts` — fixture sheets for the happy path and each row-level error.
-- Server Actions are integration-tested against the dev Supabase project using transactional rollback: each test opens a Drizzle transaction at setup, runs the action, asserts, rolls back. No mocks, no separate test project, no test data pollution.
+- Server Action integration tests live next to the action (`src/app/(admin)/**/__tests__/*.test.ts`) and run inside `withTx` + `runActionTx` savepoint join. No mocks; no separate test project.
+- One Playwright happy-path E2E at `tests/e2e/admin-onboard-and-schedule.spec.ts` (§7.4).
 
 ### Why this shape
 
@@ -359,7 +372,7 @@ Form fields:
 
 1. Auth: admin only.
 2. Validate: `startDate <= endDate`; both dates fall within the employee's current anniversary year for the given `type`. Out-of-range entries are rejected — they wouldn't affect today's balance anyway (prior anniversary year's grant is gone).
-3. Compute hours: count weekdays (M–F) in `[startDate, endDate]` × 8 hrs/day. Weekends excluded. Holidays are **not** excluded in v1 — admin shortens the range manually if a holiday falls in it.
+3. Compute hours: count weekdays (M–F) in `[startDate, endDate]` × 8 hrs/day. The 8-hr default is the Phase 2 v1 assumption — there is no `default_hours_per_day` field on `employee` in Phase 1. If part-time hours per day are introduced later, this multiplier is replaced by `employee.default_hours_per_day`. Weekends excluded. Holidays are **not** excluded in v1 — admin shortens the range manually if a holiday falls in it.
 4. Write `balance_transaction(source='historical_usage', employee_id, type, delta=-hours, occurred_at=startDate, note)`.
 5. Decrement denormalized `employee.<type>_hours_balance` by `hours`. Invariant preserved (balance = SUM of deltas).
 6. Audit log: `action = 'employee.historical_usage_recorded'`, payload = `{ type, startDate, endDate, hours }`.
@@ -375,6 +388,20 @@ Form fields:
 | `/admin/employees/[id]` | Server | Profile + invite + historical-usage actions |
 
 All gated by the `(admin)` layout's admin check (Phase 1 already enforces).
+
+### 3.8 Tests for §3 actions
+
+Integration tests (`src/app/(admin)/admin/employees/__tests__/actions.test.ts`, transactional rollback via `withTx`):
+
+- `createEmployeeAction`: happy path; `validation` on bad email / missing required field; `class_missing`; `LOWER(email)` collision.
+- `createEmployeeAction`: vacation/sick rows written only when the tenure entitlement is non-zero; the denormalized balance matches the inserted `balance_transaction.delta`.
+- `parseEmployeeImportAction`: happy path returns rows with `ok: true`; row-level errors for bad email / unknown `default_class_name` / duplicate emails within sheet; cross-row error count matches expectations.
+- `commitEmployeeImportAction`: happy path inserts N rows + balance transactions atomically; class deletion between preview and commit fails the whole transaction with `class_missing`.
+- `sendInviteAction`: happy path writes audit row with the Clerk invitation id; `not_found` for missing employee; `already_linked` when `clerk_user_id IS NOT NULL`; Clerk's "invitation already pending" maps to `invite_pending`.
+- `resendInviteAction`: happy path revokes the previous Clerk invitation then creates a new one; audit row written as `employee.invite_resent`.
+- `recordHistoricalUsageAction`: happy path writes a negative `balance_transaction(source='historical_usage')` and decrements the denormalized column; `validation` for `startDate > endDate`; `validation` for dates outside the current anniversary year; weekday-counting math matches expected hours for a range spanning a weekend.
+
+`lib/balances/__tests__/entitlements.test.ts` — pure unit tests for `computeVacationEntitlement` and `computeSickEntitlement` across boundary dates (under 90 days, exactly 90 days, just before/after 6 months, just before/after each anniversary).
 
 ---
 
@@ -492,7 +519,7 @@ export default async function SchedulePage({ params, searchParams }) {
   const shifts = mode === 'template'
     ? await resolveTemplateWeek(params.id, weekStartISO)
     : await resolveWeek(params.id, weekStartISO);
-  const classData = await db.query.class.findFirst({ where: eq(class.id, params.id) });
+  const classData = await db.query.classes.findFirst({ where: eq(classes.id, params.id) });
 
   return (
     <ScheduleClient
@@ -525,6 +552,8 @@ Mutations (Section 5) are Server Actions imported into the client tree. They cal
 | "Save as template" button | Visible | Hidden |
 
 Template-mode edits do *not* trigger the closure rule (decision #4) — that's for "save week as new template" (§6). Direct template-row edits modify the existing row in place.
+
+**Click target identity.** Every `ShiftBlock` in the grid carries the identity of the underlying row it was rendered from — `template_id` for `source: 'template'` rows, `shift_id` for `source: 'override'` rows. The click handler reads that field directly; there is no fuzzy match by `(employee, dayOfWeek, time)`. This matters when an employee has multiple template slots on the same day (e.g., Maria 8–12 *and* Maria 1–5): the admin clicks the specific block they want to edit, and the corresponding action receives that exact `template_id` (template mode) or sets `source_template_id` to that template's id (week mode, creating a replacement override). No ambiguity about which template a click is targeting.
 
 ### 4.6 Print view
 
@@ -651,7 +680,10 @@ Location: `src/app/(admin)/admin/classes/[id]/actions.ts`. Every action: admin-o
 
 1. Auth + Zod. Load row → `not_found` if missing.
 2. Compute post-update candidate.
-3. Conflict fetch with post-update fields. Pass `excludeShiftId: shiftId`.
+3. Conflict fetch with **post-update** fields:
+   - rule (a) cross-class shifts fetched for the *post-update* `employeeId` on the unchanged `date`. Critical when the admin changes `employeeId` — the rule-a context must reflect the new employee's schedule, not the old one's. A naive "fetch by current row" would miss conflicts.
+   - same-class templates fetched for the post-update `employeeId` on the date's `dayOfWeek`.
+   - Pass `excludeShiftId: shiftId` to skip self-collision against the current row.
 4. `detectShiftConflicts`. Conflict → return.
 5. Update, audit (`shift.update`), revalidate.
 
@@ -914,3 +946,313 @@ Integration tests (`(admin)/classes/[id]/__tests__/actions.test.ts`, transaction
 - `commitEnrollmentImport`: happy path; duplicate-date row error.
 
 Print view: smoke test only — render the route, assert markup contains resolved shifts plus a visible `Print` button. Asserts `window.print` is *not* called on mount (no auto-trigger).
+
+---
+
+## Section 7 — Errors, validation, audit, testing
+
+### 7.1 Error handling
+
+The `ActionError` type from §5.1 is the universal error contract for Server Actions. Every action returns `ActionResult<T> = { ok: true; data: T } | { ok: false; error: ActionError }`. No thrown exceptions cross the action boundary — unexpected exceptions are caught and mapped to `code: 'internal'`.
+
+**`runActionTx` — shared transaction wrapper.**
+
+Every mutating Server Action runs through `runActionTx` from `src/lib/actions/transactions.ts`. The wrapper enforces three invariants — actions do not hand-roll try/catch/rollback logic, which prevents the bug class where a handler returns `{ ok: false }` after a partial write but the transaction commits because no rollback sentinel was thrown.
+
+```ts
+// src/lib/actions/transactions.ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { db } from '@/db';
+import type { DrizzleTx } from '@/db/types';
+
+export const txStorage = new AsyncLocalStorage<DrizzleTx>();
+export class IntentionalRollback<T> extends Error { constructor(public value: T) { super('rollback'); } }
+
+export async function runActionTx<T>(
+  actionName: string,
+  input: unknown,
+  handler: (tx: DrizzleTx) => Promise<ActionResult<T>>,
+): Promise<ActionResult<T>> {
+  const outerTx = txStorage.getStore();
+  const runIn = outerTx ? outerTx.transaction.bind(outerTx) : db.transaction.bind(db);
+  try {
+    return await runIn(async (tx) =>
+      txStorage.run(tx, async () => {
+        const result = await handler(tx);
+        if (!result.ok) throw new IntentionalRollback(result);
+        return result;
+      })
+    );
+  } catch (e) {
+    if (e instanceof IntentionalRollback) return e.value as ActionResult<T>;
+    await logInternalError(e, sanitizeContext(actionName, input));
+    return { ok: false, error: { code: 'internal', message: 'Unexpected error' } };
+  }
+}
+```
+
+Invariants:
+
+- handler returns `ok: true` → commit.
+- handler returns `ok: false` → roll back, return the `ActionError` envelope.
+- handler throws unexpectedly → roll back, log sanitized context, return `{ code: 'internal' }`.
+
+**ALS savepoint joining for tests.** When `runActionTx` is invoked inside `withTx` (§7.4), the ALS lookup finds the outer test transaction and uses `outerTx.transaction(...)` — a SAVEPOINT — instead of opening a fresh top-level transaction. Without this, integration tests would see the Server Action's writes commit independently and pollute the dev DB; only the test's own direct writes via `tx` would roll back.
+
+**Server Action template:**
+
+```ts
+export async function someAction(input: unknown): Promise<ActionResult<T>> {
+  const admin = await requireAdmin();
+  const parsed = inputSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: 'validation', message: 'Invalid input',
+                                 fieldErrors: parsed.error.flatten().fieldErrors } };
+  }
+  return runActionTx('someAction', parsed.data, async (tx) => {
+    // business logic; return { ok: true, data } or { ok: false, error: { code, ... } }
+  });
+}
+```
+
+Auth + parse happen outside `runActionTx` so unauthorized / validation failures don't open a transaction. Business writes — including the audit log row — happen inside.
+
+**Sanitized internal-error logging.** `logInternalError(e, ctx)` writes to the **application logger**, not the audit log. Audit log is for business events only.
+
+```ts
+function sanitizeContext(actionName: string, input: unknown): Record<string, unknown> {
+  const safe: Record<string, unknown> = { action: actionName };
+  if (input && typeof input === 'object') {
+    const allowed = ['classId', 'employeeId', 'shiftId', 'templateId', 'sessionId',
+                     'mode', 'weekStartISO', 'sourceWeekStartISO', 'effectiveFromISO',
+                     'targetWeekStartISO', 'date'];
+    for (const key of allowed) {
+      if (key in (input as object)) safe[key] = (input as Record<string, unknown>)[key];
+    }
+  }
+  return safe;
+}
+```
+
+Allowlist approach — only stable identifiers are logged. **Never logged:** raw `input`, emails, names, full row payloads, import rows, invite metadata, form bodies. New actions add identifiers to the allowlist explicitly when needed.
+
+**Client surfacing:**
+
+| Error `code` | UI treatment |
+|---|---|
+| `unauthorized` | Redirect to `/sign-in` (usually `requireAdmin` already redirected). |
+| `validation` | Field-level errors via React Hook Form `setError`; non-field messages in a form-top error block. |
+| `conflict` | Modal listing each `ConflictReason` with opposing entity names + time windows. Revise / Cancel affordances. |
+| `not_found`, `class_missing`, `already_linked`, `invite_pending` | Toast with human message + a flow-specific action affordance. |
+| `internal` | Toast: "Something went wrong — please retry. If this persists, contact an admin." No internal details to the user. |
+
+### 7.2 Validation
+
+**Five layers.** Each layer assumes upstream layers may be bypassed.
+
+| Layer | Where | Responsibility |
+|---|---|---|
+| L1 | URL/searchParams parser | `weekStartISO`, `mode`, etc. Invalid `weekStartISO` (not ISO, not Monday) → **redirect to canonical URL for the current week**, never silently render a different week. `mode` defaults to `'week'` on bad input. |
+| L2 | Client form (RHF + zodResolver) | UX. Inline errors as the user types. Never authoritative. |
+| L3 | Server Action `safeParse` | Authoritative input shape check. First thing every action does after auth. |
+| L4 | Business rules | Existence checks, conflict detection, closure preconditions. Returns `ActionError` shapes. |
+| L5 | DB constraints | Should never trigger if L3/L4 pass. If it does, mapped to `code: 'internal'`. |
+
+**Shared validators — `src/lib/dates.ts` additions:**
+
+```ts
+export function isISODateString(value: string): boolean;        // 'YYYY-MM-DD' that parses to a real date
+export function isMondayISODate(value: string): boolean;        // additionally: weekday is Monday in ET
+export function timeToMinutes(value: string): number;           // 'HH:MM' → 0..1439; validates 15-min granularity
+export function assertTimeRange(start: string, end: string): void; // throws if end <= start (open intervals)
+```
+
+Used inside Zod `.refine()` / `.superRefine()` calls **and** directly in the resolver and conflict utilities. Single source of truth — regex-only validation in earlier sections is upgraded to real-date / real-time checks via these helpers.
+
+**Schedule-domain validation rules:**
+
+- `weekStartISO` must be a real `YYYY-MM-DD` date **and** a Monday in ET. URL parser canonicalizes on bad input; Server Action `safeParse` rejects.
+- Schedule dates (`date` on shifts; `effective_from`/`effective_until` on templates) must be real calendar dates, not just regex-shaped strings.
+- Time strings must match `HH:MM` and be 15-minute granular (`mm ∈ {00, 15, 30, 45}`). Enforced via `timeToMinutes` returning `NaN` on bad granularity, with the schema rejecting `NaN`.
+- `endTime > startTime` strictly. Enforced by `assertTimeRange` inside a Zod `.superRefine()`.
+- Schedule dates remain plain `'YYYY-MM-DD'` strings end-to-end (URL → resolver → client props). Never `Date.toISOString()` — UTC conversion shifts the intended ET date.
+
+**Schema locations:**
+
+- `src/lib/employees/schemas.ts` — `employeeInputSchema`, `employeeImportRowSchema`.
+- `src/lib/schedule/schemas.ts` — every shift/template Server Action's input schema.
+- `src/lib/sheets/employee-import.ts`, `src/lib/sheets/enrollment-import.ts` — sheet-row schemas.
+
+**Email normalization.** A single helper, called from inside the Zod transform:
+
+```ts
+// src/lib/employees/normalize.ts
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+```
+
+Action bodies never re-normalize. The Zod-parsed value is authoritative end-to-end. New code that touches `email` before parsing must call `normalizeEmail` explicitly or pass through the schema.
+
+### 7.3 Audit log conventions
+
+`audit_log` is for **business events only**. Internal exceptions go to the application logger, never to `audit_log`.
+
+Standardized envelope:
+
+```ts
+type AuditLogRow = {
+  actor_id: string;        // admin id from auth
+  action: string;          // dot-namespaced
+  target_id: string | null;
+  payload: Record<string, unknown>;
+  created_at: timestamptz;
+};
+```
+
+**Action namespace inventory** (Phase 2):
+
+`employee.create`, `employee.import`, `employee.invite_sent`, `employee.invite_resent`, `employee.historical_usage_recorded`, `shift.create`, `shift.update`, `shift.delete`, `template.create`, `template.update`, `template.delete`, `template.save`, `week.copy`, `enrollment.upsert`, `enrollment.delete`, `enrollment.import`.
+
+**Payload rules:**
+
+- **Mutations: changed-fields-only before/after snapshots.** Don't dump the whole row.
+
+  ```ts
+  payload: {
+    classId, shiftId,
+    before: { startTime: '08:00', endTime: '12:00' },
+    after:  { startTime: '08:15', endTime: '12:15' }
+  }
+  ```
+
+- **Deletes: enough of the deleted row to reconstruct the business action.** FK ids + primary identifying fields. No more.
+
+  ```ts
+  payload: {
+    deleted: { shiftId, classId, employeeId, date, startTime, endTime, sourceTemplateId }
+  }
+  ```
+
+- **Imports: one summary row, not per-source-row.** `payload: { count, sessionId }`. The created `employee` / `enrollment_forecast` rows are the per-record history (their `created_at` + the `sessionId` tie them back).
+- **Minimal PII.** Identifiers over free-text content. If a `note` field is part of the business action (`historical_usage.note`), include it; otherwise skip.
+- **Audit writes happen inside `runActionTx`'s transaction.** Roll back together — no orphaned "action happened" entries if the business write fails.
+
+### 7.4 Testing strategy
+
+Strategy: **transactional rollback against the dev Supabase project.** No mocks, no separate test DB, no test data pollution.
+
+**`withTx` harness — `src/test/with-tx.ts`:**
+
+```ts
+import { db } from '@/db';
+import { txStorage, IntentionalRollback } from '@/lib/actions/transactions';
+
+export async function withTx<T>(test: (tx: DrizzleTx) => Promise<T>): Promise<T> {
+  return await db.transaction(async (tx) =>
+    txStorage.run(tx, async () => {
+      const value = await test(tx);
+      throw new IntentionalRollback(value);
+    })
+  ).catch((e) => {
+    if (e instanceof IntentionalRollback) return e.value as T;
+    throw e;
+  });
+}
+```
+
+ALS context is bound before the test body runs so any Server Action invoked through `runActionTx` joins this transaction as a savepoint. The outer rollback covers both the test's direct writes and the action's writes — no dev-DB pollution from action-triggered top-level transactions.
+
+**Read-path ALS awareness.** The resolver and other read helpers access the DB via a small `dbOrTx()` helper that returns `txStorage.getStore() ?? db`. This lets a test's writes (via `tx` or via a Server Action's savepoint) be visible to a subsequent `resolveWeek` call inside the same `withTx`. In production (no ALS context), `dbOrTx()` returns the global `db` — no behavior change.
+
+**Fixture builders — `src/test/fixtures.ts`.** Every builder generates globally unique defaults so parallel tests don't collide on unique constraints (e.g., `LOWER(email)`):
+
+```ts
+export async function makeEmployee(tx: DrizzleTx, overrides?: Partial<NewEmployee>): Promise<Employee> {
+  const defaults = {
+    firstName: 'Test',
+    lastName: 'User',
+    email: `test-${crypto.randomUUID()}@example.com`,
+    /* ...other required fields with safe defaults */
+  };
+  return tx.insert(employees).values({ ...defaults, ...overrides }).returning().then(r => r[0]);
+}
+
+export async function makeClass(tx: DrizzleTx, overrides?: Partial<NewClass>): Promise<Class> {
+  const defaults = { name: `Test Class ${crypto.randomUUID().slice(0, 8)}` /* ... */ };
+  return tx.insert(classes).values({ ...defaults, ...overrides }).returning().then(r => r[0]);
+}
+```
+
+Same pattern for `makeTemplate`, `makeShift`. Composable. Every builder takes the `tx`, never the global `db`.
+
+**Direct-`db` guard.** ESLint `no-restricted-imports` rule for files under `src/**/__tests__/**` and `src/test/**` *except* `src/test/with-tx.ts`: importing `db` from `@/db` is disallowed. All other test code must take `tx` as a parameter. Catches accidental "I'll just do this one thing without `withTx`" pollution at lint time.
+
+**Test organization:**
+
+- `src/lib/**/__tests__/*.test.ts` — pure unit tests (no DB) and resolver-style tests (DB via `withTx`).
+- `src/app/(admin)/**/__tests__/*.test.ts` — Server Action integration tests via `withTx` + savepoint join through `runActionTx`.
+- `src/app/**/page.test.tsx` — page-render smoke tests.
+- `src/app/**/_components/*.test.tsx` — component tests for critical UI surfaces.
+
+**Coverage targets:**
+
+| Layer | Approach | Coverage |
+|---|---|---|
+| Pure functions (conflicts, entitlements, dates, time helpers) | Unit tests | 100% branch |
+| Resolver | Integration via `withTx` | All scenarios in §4.8 |
+| Server Actions | Integration via `withTx` + savepoint | Happy path + every documented `ActionError` |
+| Pages | Smoke render | No crash |
+| Critical UI components | Targeted component tests (see below) | Specified behaviors |
+
+**Critical UI component tests:**
+
+- `ConflictModal` renders each `ConflictReason` variant with opposing entity names.
+- `EmployeeFormErrors` (and analogous form-error components) map `ActionError.fieldErrors` to RHF errors.
+- Print page does *not* call `window.print()` on mount; the `Print` button is visible and triggers `window.print()` on click.
+
+**One thin happy-path E2E** (`tests/e2e/admin-onboard-and-schedule.spec.ts`, Playwright):
+
+1. Admin signs in (Clerk test mode).
+2. Manually adds an employee.
+3. Opens the class schedule page.
+4. Adds a template shift via template mode.
+5. Switches to week mode, adds a standalone override.
+6. Navigates to print view; confirms the shift renders.
+
+Catches route/Server-Action/client-wiring bugs that per-action integration tests miss (revalidatePath flow, search-params handling, mode toggle URL navigation). One test only; keeps Playwright surface minimal in v1.
+
+**Tests added specifically for §7:**
+
+1. Server Action returning `{ ok: false }` inside `runActionTx` rolls back partial writes.
+2. Unexpected thrown error inside `runActionTx` rolls back and returns `{ code: 'internal' }`.
+3. Internal-error logger does not include raw `input` — only the allowlisted ID context.
+4. Audit row rolls back when the business write rolls back (atomic together).
+5. Fixture builders generate unique emails and class names by default.
+6. URL parser rejects/canonicalizes a `weekStartISO` that is not a Monday (e.g., Wednesday input → redirect to that week's Monday).
+7. Delete audit payload includes the fields needed to reconstruct the deleted entity.
+8. Integration test calling a Server Action via `withTx` sees the action's writes inside the test transaction (proves savepoint join), and those writes roll back when the test transaction does.
+
+### 7.5 CI gates
+
+Phase 1 already wires `pnpm test`, `pnpm typecheck`, `pnpm lint`. Phase 2 adds:
+
+- ESLint `no-restricted-imports` rule for the test-file direct-`db` guard.
+- A pre-test **schema/version check** — `src/test/check-schema.ts` runs as a Vitest `globalSetup` step, queries `__drizzle_migrations`, and confirms the highest applied migration matches the highest file in `drizzle/`. Mismatch → fail fast with: `"DB is stale: run pnpm db:migrate"`. Prevents the entire test job from running against an out-of-date schema.
+
+Migrations are applied outside CI (against dev/staging DBs by the deployer). The CI test job assumes the DB is current; the schema check enforces it.
+
+**Migration workflow:**
+
+- `pnpm db:generate` produces `drizzle/0001_<slug>.sql` from schema diffs.
+- Human review of the SQL per §2's "Migration review" checklist.
+- `pnpm db:migrate` applies it.
+- Migration committed alongside the schema changes.
+
+### 7.6 Out of scope for Phase 2 testing
+
+- Visual regression / pixel-diff for print.
+- Load / performance benchmarks (resolver at ~35 rows isn't a concern).
+- Cross-browser print compatibility (Chrome/Edge/Safari assumed reasonable).
+- Migration rollback tests — forward-only, restore-from-snapshot.
+- Full-suite E2E — only the one happy-path smoke test described in §7.4.
