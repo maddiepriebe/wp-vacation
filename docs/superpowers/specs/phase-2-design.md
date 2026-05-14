@@ -322,6 +322,8 @@ Client sends the array of valid rows back. Single transaction:
 
 On any failure, full transaction rollback. The `sessionStorage` entry survives so the admin can retry or inspect.
 
+**Session lifetime** is the browser tab; closing the tab discards the in-progress import. No server-side persistence of the preview state.
+
 ### 3.4 Initial balance writes
 
 For each newly-inserted employee (both manual and import paths), inside the same transaction as the `employee` insert:
@@ -704,7 +706,7 @@ Same file. Direct CRUD on the recurring schedule.
 2. `effectiveFromISO` defaults to `weekStartOf(todayET())`.
 3. Conflict fetch: active templates for `classId` matching the range predicate (rules c, d); employee's active templates in *other* classes on the same `dayOfWeek` matching the range predicate (rule a for templates).
 4. `detectShiftConflicts(candidate, ctx)`. Conflict → return.
-5. Insert with `effective_until = NULL`. Audit + revalidate.
+5. Insert with `effective_until = NULL`. Audit (`action = 'template.create'`). Revalidate.
 
 Does not invoke the closure rule. Adding a slot to the existing active version isn't a new version — closure is only for save-as-template (§6).
 
@@ -712,7 +714,7 @@ Does not invoke the closure rule. Adding a slot to the existing active version i
 
 1. Auth + Zod. Load → `not_found`.
 2. Conflict check with `excludeTemplateId`.
-3. Update in place. Audit + revalidate.
+3. Update in place. Audit (`action = 'template.update'`). Revalidate.
 
 In-place template edits propagate to all weeks, past and future, except where overrides exist. Past-week views without overrides will retroactively reflect new template times. Admins wanting a forward-only cutover use save-as-template (§6).
 
@@ -720,7 +722,7 @@ In-place template edits propagate to all weeks, past and future, except where ov
 
 1. Auth + Zod. Load → `not_found`.
 2. Delete. Per §2's `ON DELETE SET NULL`, replacement overrides referencing this template become standalone.
-3. Audit + revalidate.
+3. Audit (`action = 'template.delete'`). Revalidate.
 
 ### 5.5 Drag-to-move
 
@@ -824,9 +826,12 @@ Neither preserves "what you saw in the source week" predictably once templates d
 
 UX: "Copy week" button on the schedule grid. `CopyWeekDialog` shows source `weekStartISO` and a date picker for the target. Confirmation:
 
-> `Copy N overrides from <source> to <target>? Existing concrete shifts in the target week will be deleted.`
+> `Copy <N> shifts from <source week> to <target week>? This will delete <M> existing shifts in the target week.`
 
-`N` is the count of `source: 'override'` rows in the resolved source week — not all rendered rows.
+- **`N` = count of source `ResolvedShift`s** (templates + overrides combined). This is what the admin sees on the source week and what they expect the target week to look like after the copy — template-derived rows arrive via template expansion in the target, override rows are explicitly copied. Communicating the full visible count avoids the trap of admins thinking "only 3 shifts copied" when 30 are actually being duplicated via the unchanged templates.
+- **`M` = count of existing `schedule_shift` rows in the target week range** — exactly the set that step 4 deletes.
+
+Both counts are available without extra queries: `N` comes from the `resolveWeek(classId, sourceWeekStartISO)` call already needed for step 2, `M` from a `SELECT COUNT(*)` against the same range step 4 deletes.
 
 **`copyWeekAction({ classId, sourceWeekStartISO, targetWeekStartISO })`**
 
