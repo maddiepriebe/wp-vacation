@@ -47,10 +47,34 @@ export const balanceSourceEnum = pgEnum("balance_source", [
   "sick_log",
   "bereavement_log",
   "admin_adjustment",
+  "historical_usage",
 ]);
 
 export const actorTypeEnum = pgEnum("actor_type", [
   "employee",
   "admin",
   "system",
+]);
+
+export const timeOffTypeEnum = pgEnum("time_off_type", [
+  "vacation",
+  "sick",
+  "bereavement",
+  "unpaid",
+  "unallocated",
+]);
+
+export const timeOffStatusEnum = pgEnum("time_off_status", [
+  "pending",
+  "approved",
+  "rejected",
+  "cancelled",
+]);
+
+export const bereavementRelationEnum = pgEnum("bereavement_relation", [
+  "parent",
+  "sibling",
+  "spouse",
+  "child",
+  "grandparent",
 ]);
