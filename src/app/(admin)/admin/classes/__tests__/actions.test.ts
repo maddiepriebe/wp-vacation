@@ -778,9 +778,10 @@ describe("saveAsTemplateAction", () => {
         ],
       });
       expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.error.code).toBe("conflict");
+      if (!result.ok && result.error.code === "conflict") {
         expect(result.error.conflicts.some((c) => c.rule === "c")).toBe(true);
+      } else {
+        expect.fail(`expected conflict error, got ${result.ok ? "ok" : result.error.code}`);
       }
     });
   });
