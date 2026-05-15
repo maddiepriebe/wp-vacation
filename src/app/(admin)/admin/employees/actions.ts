@@ -1,6 +1,6 @@
 "use server";
 
-import { eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { runActionTx } from "@/lib/actions/transactions";
@@ -19,7 +19,13 @@ import { writeAuditLog } from "@/lib/audit/write";
 import { todayET } from "@/lib/dates";
 import { validateEmployeeImportSheet } from "@/lib/sheets/employee-import";
 import type { ParsedRow } from "@/lib/sheets/parse";
-import { balanceTransactions, classes, employees } from "@/db/schema";
+import { inviteUser, resendInvite } from "@/lib/clerk-invite";
+import {
+  auditLog,
+  balanceTransactions,
+  classes,
+  employees,
+} from "@/db/schema";
 
 export async function createEmployeeAction(
   input: unknown,
@@ -324,5 +330,177 @@ export async function commitEmployeeImportAction(
 
     revalidatePath("/admin/employees");
     return { ok: true, data: { ids } };
+  });
+}
+
+const invitePayloadSchema = z.object({
+  employeeId: z.string().uuid(),
+});
+
+// Guardrail A: the invitationId we read from a prior audit row must be a
+// non-empty string. Anything else means the prior row is corrupt; bail with
+// a validation error instead of throwing.
+const inviteAuditPayloadSchema = z
+  .object({ invitationId: z.string().min(1) })
+  .passthrough();
+
+export async function sendInviteAction(
+  input: unknown,
+): Promise<ActionResult<{ invitationId: string }>> {
+  const admin = await requireAdmin();
+  const parsed = invitePayloadSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input" },
+    };
+  }
+  const { employeeId } = parsed.data;
+
+  return runActionTx("employee.invite_sent", parsed.data, async (tx) => {
+    const [emp] = await tx
+      .select()
+      .from(employees)
+      .where(eq(employees.id, employeeId));
+    if (!emp) {
+      return {
+        ok: false,
+        error: { code: "not_found", message: "Employee not found" },
+      };
+    }
+    if (emp.clerkUserId) {
+      return {
+        ok: false,
+        error: {
+          code: "already_linked",
+          message: "Already linked to a Clerk user",
+        },
+      };
+    }
+
+    const inviteResult = await inviteUser({
+      emailAddress: emp.email,
+      publicMetadata: { employeeId: emp.id, role: "employee" },
+    });
+    if (!inviteResult.ok) return inviteResult;
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "employee.invite_sent",
+      targetId: emp.id,
+      payload: { invitationId: inviteResult.data.invitationId },
+    });
+
+    revalidatePath(`/admin/employees/${emp.id}`);
+    return {
+      ok: true,
+      data: { invitationId: inviteResult.data.invitationId },
+    };
+  });
+}
+
+export async function resendInviteAction(
+  input: unknown,
+): Promise<ActionResult<{ invitationId: string }>> {
+  const admin = await requireAdmin();
+  const parsed = invitePayloadSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input" },
+    };
+  }
+  const { employeeId } = parsed.data;
+
+  return runActionTx("employee.invite_resent", parsed.data, async (tx) => {
+    const [emp] = await tx
+      .select()
+      .from(employees)
+      .where(eq(employees.id, employeeId));
+    if (!emp) {
+      return {
+        ok: false,
+        error: { code: "not_found", message: "Employee not found" },
+      };
+    }
+    if (emp.clerkUserId) {
+      return {
+        ok: false,
+        error: {
+          code: "already_linked",
+          message: "Already linked to a Clerk user",
+        },
+      };
+    }
+
+    // Guardrail A: find the most recent invite_sent / invite_resent row for
+    // this employee. If none exists, validation error (NOT not_found) so the
+    // UI can prompt the admin to send a new invite instead.
+    const [latestInvite] = await tx
+      .select()
+      .from(auditLog)
+      .where(
+        and(
+          eq(auditLog.entityType, "employee"),
+          eq(auditLog.entityId, emp.id),
+          inArray(auditLog.action, [
+            "employee.invite_sent",
+            "employee.invite_resent",
+          ]),
+        ),
+      )
+      .orderBy(desc(auditLog.createdAt))
+      .limit(1);
+    if (!latestInvite) {
+      return {
+        ok: false,
+        error: {
+          code: "validation",
+          message:
+            "No prior invitation to resend; send a new invite first",
+        },
+      };
+    }
+
+    // Guardrail A: validate the payload defensively. If the prior row is
+    // missing `invitationId` (data corruption / older row format), bail with
+    // a validation error rather than crashing the action.
+    const payloadCheck = inviteAuditPayloadSchema.safeParse(
+      latestInvite.payload,
+    );
+    if (!payloadCheck.success) {
+      return {
+        ok: false,
+        error: {
+          code: "validation",
+          message:
+            "Prior invitation record is malformed; send a new invite instead",
+        },
+      };
+    }
+    const prevId = payloadCheck.data.invitationId;
+
+    const resendResult = await resendInvite({
+      previousInvitationId: prevId,
+      emailAddress: emp.email,
+      publicMetadata: { employeeId: emp.id, role: "employee" },
+    });
+    if (!resendResult.ok) return resendResult;
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "employee.invite_resent",
+      targetId: emp.id,
+      payload: {
+        invitationId: resendResult.data.invitationId,
+        previousInvitationId: prevId,
+      },
+    });
+
+    revalidatePath(`/admin/employees/${emp.id}`);
+    return {
+      ok: true,
+      data: { invitationId: resendResult.data.invitationId },
+    };
   });
 }

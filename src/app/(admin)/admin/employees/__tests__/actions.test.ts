@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   auditLog,
@@ -23,11 +23,21 @@ vi.mock("@/lib/auth", () => ({
   requireAdmin: async () => ({ id: currentAdminId.value }),
 }));
 
+// Mock the Clerk wrapper so invite tests don't reach the real SDK. Tests
+// reset the implementations in their own beforeEach.
+vi.mock("@/lib/clerk-invite", () => ({
+  inviteUser: vi.fn(),
+  resendInvite: vi.fn(),
+}));
+
 import {
   commitEmployeeImportAction,
   createEmployeeAction,
   parseEmployeeImportAction,
+  resendInviteAction,
+  sendInviteAction,
 } from "@/app/(admin)/admin/employees/actions";
+import * as clerkInvite from "@/lib/clerk-invite";
 import { utils, write as xlsxWrite } from "xlsx";
 
 function makeFormData(rows: Array<Record<string, unknown>>): FormData {
@@ -465,6 +475,240 @@ describe("commitEmployeeImportAction", () => {
           );
         }
       }
+    });
+  });
+});
+
+describe("sendInviteAction", () => {
+  beforeEach(() => {
+    vi.mocked(clerkInvite.inviteUser).mockReset();
+    vi.mocked(clerkInvite.resendInvite).mockReset();
+  });
+
+  it("creates an invitation and writes an audit row", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      vi.mocked(clerkInvite.inviteUser).mockResolvedValue({
+        ok: true,
+        data: { invitationId: "inv_abc" },
+      });
+
+      const result = await sendInviteAction({ employeeId: empResult.data.id });
+      expect(result.ok).toBe(true);
+
+      const audits = await tx
+        .select()
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "employee.invite_sent"),
+            eq(auditLog.entityId, empResult.data.id),
+          ),
+        );
+      expect(audits).toHaveLength(1);
+      expect(
+        (audits[0].payload as { invitationId: string }).invitationId,
+      ).toBe("inv_abc");
+    });
+  });
+
+  it("returns not_found for missing employee", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+      const result = await sendInviteAction({
+        employeeId: "00000000-0000-0000-0000-000000000000",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("not_found");
+    });
+  });
+
+  it("returns already_linked when clerk_user_id is set", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      await tx
+        .update(employees)
+        .set({ clerkUserId: "user_xyz" })
+        .where(eq(employees.id, empResult.data.id));
+
+      const result = await sendInviteAction({ employeeId: empResult.data.id });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("already_linked");
+    });
+  });
+
+  it("maps invite_pending from Clerk wrapper", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      vi.mocked(clerkInvite.inviteUser).mockResolvedValue({
+        ok: false,
+        error: { code: "invite_pending", message: "..." },
+      });
+
+      const result = await sendInviteAction({ employeeId: empResult.data.id });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invite_pending");
+    });
+  });
+});
+
+describe("resendInviteAction", () => {
+  beforeEach(() => {
+    vi.mocked(clerkInvite.inviteUser).mockReset();
+    vi.mocked(clerkInvite.resendInvite).mockReset();
+  });
+
+  it("revokes prior invite and writes employee.invite_resent audit", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      vi.mocked(clerkInvite.inviteUser).mockResolvedValue({
+        ok: true,
+        data: { invitationId: "inv_first" },
+      });
+      const first = await sendInviteAction({
+        employeeId: empResult.data.id,
+      });
+      expect(first.ok).toBe(true);
+
+      vi.mocked(clerkInvite.resendInvite).mockResolvedValue({
+        ok: true,
+        data: { invitationId: "inv_second" },
+      });
+      const result = await resendInviteAction({
+        employeeId: empResult.data.id,
+      });
+      expect(result.ok).toBe(true);
+
+      expect(vi.mocked(clerkInvite.resendInvite)).toHaveBeenCalledWith(
+        expect.objectContaining({ previousInvitationId: "inv_first" }),
+      );
+
+      const audits = await tx
+        .select()
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "employee.invite_resent"),
+            eq(auditLog.entityId, empResult.data.id),
+          ),
+        );
+      expect(audits).toHaveLength(1);
+    });
+  });
+
+  it("resend requested but no prior invite audit exists → validation error", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      const result = await resendInviteAction({
+        employeeId: empResult.data.id,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("validation");
+        expect(result.error.message).toBe(
+          "No prior invitation to resend; send a new invite first",
+        );
+      }
+    });
+  });
+
+  it("resend with malformed prior audit payload returns validation, does not throw", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      // Insert an invite_sent audit row whose payload lacks invitationId.
+      await tx.insert(auditLog).values({
+        actorType: "admin",
+        actorId: admin.id,
+        action: "employee.invite_sent",
+        entityType: "employee",
+        entityId: empResult.data.id,
+        payload: {},
+      });
+
+      const result = await resendInviteAction({
+        employeeId: empResult.data.id,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
     });
   });
 });
