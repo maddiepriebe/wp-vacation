@@ -1,11 +1,14 @@
 import type { DB } from "@/db/client";
 import {
+  admins,
   classes,
   employees,
   scheduleShiftTemplates,
   scheduleShifts,
+  type Admin,
   type Class,
   type Employee,
+  type NewAdmin,
   type NewClass,
   type NewEmployee,
   type NewScheduleShift,
@@ -18,6 +21,23 @@ type DrizzleTx = Parameters<Parameters<DB["transaction"]>[0]>[0];
 
 function uniqueSuffix(): string {
   return crypto.randomUUID().slice(0, 8);
+}
+
+export async function makeAdmin(
+  tx: DrizzleTx,
+  overrides: Partial<NewAdmin> = {},
+): Promise<Admin> {
+  const defaults: NewAdmin = {
+    firstName: "Test",
+    lastName: "Admin",
+    email: `admin-${crypto.randomUUID()}@example.com`,
+    adminRole: "hr",
+  };
+  const [row] = await tx
+    .insert(admins)
+    .values({ ...defaults, ...overrides })
+    .returning();
+  return row;
 }
 
 export async function makeClass(
