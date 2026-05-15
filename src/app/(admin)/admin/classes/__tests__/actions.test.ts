@@ -803,3 +803,144 @@ describe("saveAsTemplateAction", () => {
     });
   });
 });
+
+import { copyWeekAction } from "@/app/(admin)/admin/classes/[id]/actions";
+
+describe("copyWeekAction", () => {
+  it("happy path: target's concrete shifts equal source's overrides shifted by date delta", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      await tx.insert(scheduleShifts).values({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "09:00", endTime: "11:00", sourceTemplateId: t.id,
+      });
+      await tx.insert(scheduleShifts).values({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-20",
+        startTime: "13:00", endTime: "17:00", sourceTemplateId: null,
+      });
+      currentAdminId.value = admin.id;
+
+      const result = await copyWeekAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        targetWeekStartISO: "2026-05-25",
+      });
+      expect(result.ok).toBe(true);
+
+      const target = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(and(eq(scheduleShifts.classId, cls.id), eq(scheduleShifts.date, "2026-05-25")));
+      expect(target).toHaveLength(1);
+      expect(target[0].startTime).toBe("09:00:00");
+      expect(target[0].sourceTemplateId).toBe(t.id);
+
+      const wedTarget = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(and(eq(scheduleShifts.classId, cls.id), eq(scheduleShifts.date, "2026-05-27")));
+      expect(wedTarget).toHaveLength(1);
+      expect(wedTarget[0].sourceTemplateId).toBeNull();
+    });
+  });
+
+  it("deletes existing target-week shifts before inserting", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      // Existing shift in target week
+      const [existing] = await tx
+        .insert(scheduleShifts)
+        .values({
+          classId: cls.id, employeeId: emp.id, date: "2026-05-25",
+          startTime: "08:00", endTime: "12:00", sourceTemplateId: null,
+        })
+        .returning();
+      // Source-week override
+      await tx.insert(scheduleShifts).values({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-19",
+        startTime: "14:00", endTime: "16:00", sourceTemplateId: null,
+      });
+      currentAdminId.value = admin.id;
+
+      const result = await copyWeekAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        targetWeekStartISO: "2026-05-25",
+      });
+      expect(result.ok).toBe(true);
+
+      // Existing 2026-05-25 row deleted; source-week 2026-05-19 → target-week 2026-05-26.
+      const target25 = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(and(eq(scheduleShifts.classId, cls.id), eq(scheduleShifts.date, "2026-05-25")));
+      expect(target25).toHaveLength(0);
+
+      const target26 = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(and(eq(scheduleShifts.classId, cls.id), eq(scheduleShifts.date, "2026-05-26")));
+      expect(target26).toHaveLength(1);
+
+      const [audit] = await tx.select().from(auditLog).where(eq(auditLog.action, "week.copy"));
+      expect(audit.entityId).toBe(cls.id);
+      expect(audit.payload).toMatchObject({ deletedShiftIds: [existing.id] });
+    });
+  });
+
+  it("rejects source == target with validation error", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const result = await copyWeekAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        targetWeekStartISO: "2026-05-18",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+
+  it("preserves source_template_id verbatim — copied row referencing closed template renders standalone in target", async () => {
+    // The act of insertion preserves the FK; the resolver in the target week
+    // will simply not suppress anything because the template is closed there.
+    // Here we just assert FK preservation.
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00",
+        effectiveFrom: "2026-05-11", effectiveUntil: "2026-05-24",  // closes before target week
+      });
+      await tx.insert(scheduleShifts).values({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "09:00", endTime: "11:00", sourceTemplateId: t.id,
+      });
+      currentAdminId.value = admin.id;
+
+      const result = await copyWeekAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        targetWeekStartISO: "2026-05-25",
+      });
+      expect(result.ok).toBe(true);
+      const [copy] = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(and(eq(scheduleShifts.classId, cls.id), eq(scheduleShifts.date, "2026-05-25")));
+      expect(copy.sourceTemplateId).toBe(t.id);
+    });
+  });
+});

@@ -712,3 +712,82 @@ export async function saveAsTemplateAction(input: unknown): Promise<ActionResult
     },
   );
 }
+
+export async function copyWeekAction(input: unknown): Promise<ActionResult<{ classId: string; copiedOverrideCount: number }>> {
+  const admin = await requireAdmin();
+  const parsed = copyWeekInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+  const deltaDays =
+    (Date.UTC(...(data.targetWeekStartISO.split("-").map(Number) as [number, number, number])) -
+      Date.UTC(...(data.sourceWeekStartISO.split("-").map(Number) as [number, number, number]))) /
+    86400000;
+
+  return runActionTx(
+    "week.copy",
+    { classId: data.classId, sourceWeekStartISO: data.sourceWeekStartISO, targetWeekStartISO: data.targetWeekStartISO },
+    async (tx) => {
+      const [cls] = await tx.select({ id: classes.id }).from(classes).where(eq(classes.id, data.classId));
+      if (!cls) return { ok: false, error: { code: "class_missing", message: "Class not found" } };
+
+      // Source overrides — read directly, not via resolveWeek, to preserve sourceTemplateId verbatim.
+      const sourceOverrides = await tx
+        .select()
+        .from(scheduleShifts)
+        .where(
+          and(
+            eq(scheduleShifts.classId, data.classId),
+            gte(scheduleShifts.date, data.sourceWeekStartISO),
+            lte(scheduleShifts.date, weekEnd(data.sourceWeekStartISO)),
+          ),
+        );
+
+      // Delete target-week concrete shifts (target wipe — see §6.2).
+      const deletedShiftIds = (
+        await tx
+          .delete(scheduleShifts)
+          .where(
+            and(
+              eq(scheduleShifts.classId, data.classId),
+              gte(scheduleShifts.date, data.targetWeekStartISO),
+              lte(scheduleShifts.date, weekEnd(data.targetWeekStartISO)),
+            ),
+          )
+          .returning({ id: scheduleShifts.id })
+      ).map((r) => r.id);
+
+      // Insert shifted overrides.
+      for (const o of sourceOverrides) {
+        await tx.insert(scheduleShifts).values({
+          classId: data.classId,
+          employeeId: o.employeeId,
+          date: addDaysISO(o.date, deltaDays),
+          startTime: o.startTime,
+          endTime: o.endTime,
+          sourceTemplateId: o.sourceTemplateId,
+        });
+      }
+
+      await writeAuditLog(tx, {
+        actorAdminId: admin.id,
+        action: "week.copy",
+        targetId: data.classId,
+        payload: {
+          classId: data.classId,
+          sourceWeekStartISO: data.sourceWeekStartISO,
+          targetWeekStartISO: data.targetWeekStartISO,
+          copiedOverrideCount: sourceOverrides.length,
+          deletedShiftIds,
+        },
+      });
+
+      revalidatePath(`/admin/classes/${data.classId}/schedule`);
+      return { ok: true, data: { classId: data.classId, copiedOverrideCount: sourceOverrides.length } };
+    },
+  );
+}
