@@ -11,6 +11,22 @@ const config = [
   ...compat.extends("next/core-web-vitals", "next/typescript"),
 ];
 
+// Treat underscore-prefixed identifiers as intentionally unused (standard convention).
+config.push({
+  rules: {
+    "@typescript-eslint/no-unused-vars": [
+      "warn",
+      {
+        argsIgnorePattern: "^_",
+        varsIgnorePattern: "^_",
+        caughtErrorsIgnorePattern: "^_",
+        destructuredArrayIgnorePattern: "^_",
+        ignoreRestSiblings: true,
+      },
+    ],
+  },
+});
+
 config.push({
   files: ["src/**/__tests__/**/*.{ts,tsx}", "src/test/**/*.{ts,tsx}"],
   ignores: [
