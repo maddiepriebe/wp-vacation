@@ -8,11 +8,17 @@ import type {
   TemplateLike,
 } from "@/lib/schedule/types";
 
+// Postgres `time` columns stringify to 'HH:MM:SS'; validated user input is 'HH:MM'.
+// Normalize so both shapes work through timeToMinutes (which requires 'HH:MM').
+function normTime(t: string): string {
+  return t.length > 5 ? t.slice(0, 5) : t;
+}
+
 function overlapsTime(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-  const aS = timeToMinutes(aStart);
-  const aE = timeToMinutes(aEnd);
-  const bS = timeToMinutes(bStart);
-  const bE = timeToMinutes(bEnd);
+  const aS = timeToMinutes(normTime(aStart));
+  const aE = timeToMinutes(normTime(aEnd));
+  const bS = timeToMinutes(normTime(bStart));
+  const bE = timeToMinutes(normTime(bEnd));
   return aS < bE && bS < aE;
 }
 
@@ -64,7 +70,7 @@ export function detectShiftConflicts(
       if (t.dayOfWeek !== dow) continue;
       if (!templateActiveOnOrAfter(t, candidate.date)) continue;
       if (!overlapsTime(candidate.startTime, candidate.endTime, t.startTime, t.endTime)) continue;
-      const identical = t.startTime === candidate.startTime && t.endTime === candidate.endTime;
+      const identical = normTime(t.startTime) === normTime(candidate.startTime) && normTime(t.endTime) === normTime(candidate.endTime);
       out.push(
         identical
           ? { rule: "d", otherId: t.id }
