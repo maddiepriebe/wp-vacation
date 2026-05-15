@@ -18,6 +18,7 @@ import {
   createShiftTemplateInputSchema,
   deleteShiftInputSchema,
   deleteShiftTemplateInputSchema,
+  moveShiftInputSchema,
   updateShiftInputSchema,
   updateShiftTemplateInputSchema,
 } from "@/lib/schedule/schemas";
@@ -458,5 +459,72 @@ export async function deleteShiftTemplateAction(input: unknown): Promise<ActionR
 
     revalidatePath(`/admin/classes/${existing.classId}/schedule`);
     return { ok: true, data: { id: templateId } };
+  });
+}
+
+export async function moveShiftAction(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = moveShiftInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+
+  return runActionTx("shift.move", { shiftId: data.shiftId, date: data.date }, async (tx) => {
+    const [existing] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, data.shiftId));
+    if (!existing) return { ok: false, error: { code: "not_found", message: "Shift not found" } };
+
+    const ctx = await loadClassesEmployeesTemplatesForShift(tx, {
+      classId: existing.classId,
+      employeeId: existing.employeeId,
+      date: data.date,
+    });
+
+    const conflicts = detectShiftConflicts(
+      {
+        kind: "shift",
+        classId: existing.classId,
+        employeeId: existing.employeeId,
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+      },
+      {
+        crossClassShifts: ctx.crossClassShifts,
+        crossClassTemplates: [],
+        sameClassTemplates: ctx.sameClassTemplates,
+        excludeShiftId: data.shiftId,
+        excludeTemplateId: existing.sourceTemplateId ?? undefined,
+      },
+    );
+    if (conflicts.length > 0) {
+      return { ok: false, error: { code: "conflict", message: "Move target has conflicts", conflicts } };
+    }
+
+    await tx
+      .update(scheduleShifts)
+      .set({
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        updatedAt: new Date(),
+      })
+      .where(eq(scheduleShifts.id, data.shiftId));
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "shift.move",
+      targetId: data.shiftId,
+      payload: {
+        before: { date: existing.date, startTime: existing.startTime, endTime: existing.endTime },
+        after: { date: data.date, startTime: data.startTime, endTime: data.endTime },
+      },
+    });
+
+    revalidatePath(`/admin/classes/${existing.classId}/schedule`);
+    return { ok: true, data: { id: data.shiftId } };
   });
 }

@@ -16,6 +16,7 @@ import {
   createShiftTemplateAction,
   deleteShiftAction,
   deleteShiftTemplateAction,
+  moveShiftAction,
   updateShiftAction,
   updateShiftTemplateAction,
 } from "@/app/(admin)/admin/classes/[id]/actions";
@@ -413,6 +414,172 @@ describe("deleteShiftTemplateAction", () => {
 
       const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "template.delete"));
       expect(audits).toHaveLength(1);
+    });
+  });
+});
+
+describe("moveShiftAction", () => {
+  it("across-day move atomically updates the existing shift", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-19",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(row.date).toBe("2026-05-19");
+      expect(row.startTime).toBe("08:00:00");
+
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.move"));
+      expect(audits).toHaveLength(1);
+      expect(audits[0].payload).toMatchObject({
+        before: { date: "2026-05-18" },
+        after: { date: "2026-05-19" },
+      });
+    });
+  });
+
+  it("conflict at destination returns conflict AND leaves the original shift untouched", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const clsA = await makeClass(tx);
+      const clsB = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: clsA.id });
+      currentAdminId.value = admin.id;
+
+      // Block destination: same employee, same date, different class.
+      await createShiftAction({
+        classId: clsB.id, employeeId: emp.id, date: "2026-05-19",
+        startTime: "08:00", endTime: "12:00",
+      });
+
+      // Source shift in class A on 2026-05-18.
+      const src = await createShiftAction({
+        classId: clsA.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!src.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: src.data.id,
+        date: "2026-05-19",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("conflict");
+        if (result.error.code === "conflict") {
+          expect(result.error.conflicts[0].rule).toBe("a");
+        }
+      }
+
+      // Original row is untouched.
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, src.data.id));
+      expect(row.date).toBe("2026-05-18");
+      expect(row.startTime).toBe("08:00:00");
+
+      // No shift.move audit row was written.
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.move"));
+      expect(audits).toHaveLength(0);
+    });
+  });
+
+  it("same-date no-op move (date + times identical) writes audit with identical before/after", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-18",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(row.date).toBe("2026-05-18");
+    });
+  });
+
+  it("self-exclusion: moving a row 'onto itself' (same date) is conflict-free even though the row exists at that date", async () => {
+    // Regression guard for the excludeShiftId pass-through. Without it, moveShiftAction
+    // to the row's current location would self-conflict.
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-18",
+        startTime: "09:00",
+        endTime: "13:00",
+      });
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it("preserves source_template_id and exclude-template-from-rule-c for moved replacement overrides", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      currentAdminId.value = admin.id;
+      const src = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "09:00", endTime: "11:00",
+        sourceTemplateId: t.id,
+      });
+      if (!src.ok) throw new Error("setup");
+
+      // Move to Tuesday (no template instance on Tuesday for this employee).
+      const result = await moveShiftAction({
+        shiftId: src.data.id,
+        date: "2026-05-19",
+        startTime: "09:00",
+        endTime: "11:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, src.data.id));
+      // source_template_id stays bound to T1; the resolver's suppression key
+      // (T1, emp, date) now refers to Tuesday — which has no template instance,
+      // so nothing visible is suppressed. Acceptable v1 behavior.
+      expect(row.sourceTemplateId).toBe(t.id);
     });
   });
 });

@@ -4,6 +4,7 @@ import {
   createShiftTemplateInputSchema,
   deleteShiftInputSchema,
   deleteShiftTemplateInputSchema,
+  moveShiftInputSchema,
   updateShiftInputSchema,
   updateShiftTemplateInputSchema,
 } from "@/lib/schedule/schemas";
@@ -85,5 +86,23 @@ describe("updateShiftTemplateInputSchema and delete", () => {
   it("delete requires templateId uuid", () => {
     expect(() => deleteShiftTemplateInputSchema.parse({ templateId: uuid })).not.toThrow();
     expect(() => deleteShiftTemplateInputSchema.parse({ templateId: "bad" })).toThrow();
+  });
+});
+
+describe("moveShiftInputSchema", () => {
+  const valid = {
+    shiftId: "00000000-0000-0000-0000-000000000001",
+    date: "2026-05-19",
+    startTime: "08:00",
+    endTime: "12:00",
+  };
+  it("parses a valid input", () => {
+    expect(() => moveShiftInputSchema.parse(valid)).not.toThrow();
+  });
+  it("rejects start >= end", () => {
+    expect(() => moveShiftInputSchema.parse({ ...valid, startTime: "12:00", endTime: "08:00" })).toThrow();
+  });
+  it("rejects bad date", () => {
+    expect(() => moveShiftInputSchema.parse({ ...valid, date: "2026-02-30" })).toThrow();
   });
 });

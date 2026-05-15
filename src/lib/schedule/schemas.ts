@@ -85,9 +85,19 @@ export const updateShiftTemplateInputSchema = z
 
 export const deleteShiftTemplateInputSchema = z.object({ templateId: uuid });
 
+export const moveShiftInputSchema = z
+  .object({
+    shiftId: uuid,
+    date: isoDate,
+    startTime: timeStr,
+    endTime: timeStr,
+  })
+  .superRefine(timeRangeRefine);
+
 export type CreateShiftInput = z.infer<typeof createShiftInputSchema>;
 export type UpdateShiftInput = z.infer<typeof updateShiftInputSchema>;
 export type DeleteShiftInput = z.infer<typeof deleteShiftInputSchema>;
 export type CreateShiftTemplateInput = z.infer<typeof createShiftTemplateInputSchema>;
 export type UpdateShiftTemplateInput = z.infer<typeof updateShiftTemplateInputSchema>;
 export type DeleteShiftTemplateInput = z.infer<typeof deleteShiftTemplateInputSchema>;
+export type MoveShiftInput = z.infer<typeof moveShiftInputSchema>;
