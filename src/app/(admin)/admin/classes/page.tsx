@@ -1,3 +1,5 @@
+import Link from "next/link";
+import type { Route } from "next";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/db/client";
 import { classes } from "@/db/schema";
@@ -37,7 +39,14 @@ export default async function AdminClassesPage() {
             ) : (
               rows.map((r) => (
                 <tr key={r.id}>
-                  <td className="px-4 py-2">{r.name}</td>
+                  <td className="px-4 py-2">
+                    <Link
+                      href={`/admin/classes/${r.id}/schedule` as Route}
+                      className="font-medium text-primary hover:underline"
+                    >
+                      {r.name}
+                    </Link>
+                  </td>
                   <td className="px-4 py-2 capitalize">
                     {r.ageGroup.replace("_", " ")}
                   </td>
