@@ -1,12 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  commitEnrollmentImportInputSchema,
+  copyWeekInputSchema,
   createShiftInputSchema,
   createShiftTemplateInputSchema,
+  deleteEnrollmentForecastInputSchema,
   deleteShiftInputSchema,
   deleteShiftTemplateInputSchema,
+  enrollmentImportRowSchema,
   moveShiftInputSchema,
+  saveAsTemplateInputSchema,
   updateShiftInputSchema,
   updateShiftTemplateInputSchema,
+  upsertEnrollmentForecastInputSchema,
 } from "@/lib/schedule/schemas";
 
 const uuid = "00000000-0000-0000-0000-000000000001";
@@ -104,5 +110,105 @@ describe("moveShiftInputSchema", () => {
   });
   it("rejects bad date", () => {
     expect(() => moveShiftInputSchema.parse({ ...valid, date: "2026-02-30" })).toThrow();
+  });
+});
+
+describe("saveAsTemplateInputSchema", () => {
+  const valid = {
+    classId: uuid,
+    sourceWeekStartISO: "2026-05-18",
+    effectiveFromISO: "2026-05-25",
+    selectedShifts: [
+      { source: "template", templateId: uuid },
+      { source: "override", shiftId: uuid },
+    ],
+  };
+  it("parses a valid input", () => {
+    expect(() => saveAsTemplateInputSchema.parse(valid)).not.toThrow();
+  });
+  it("accepts an empty selectedShifts array (close-only)", () => {
+    expect(() => saveAsTemplateInputSchema.parse({ ...valid, selectedShifts: [] })).not.toThrow();
+  });
+  it("rejects non-Monday sourceWeekStartISO", () => {
+    expect(() => saveAsTemplateInputSchema.parse({ ...valid, sourceWeekStartISO: "2026-05-20" })).toThrow();
+  });
+  it("rejects non-Monday effectiveFromISO", () => {
+    expect(() => saveAsTemplateInputSchema.parse({ ...valid, effectiveFromISO: "2026-05-26" })).toThrow();
+  });
+  it("rejects malformed selectedShifts entries", () => {
+    expect(() => saveAsTemplateInputSchema.parse({ ...valid, selectedShifts: [{ source: "template" }] })).toThrow();
+    expect(() => saveAsTemplateInputSchema.parse({ ...valid, selectedShifts: [{ source: "override", templateId: uuid }] })).toThrow();
+  });
+});
+
+describe("copyWeekInputSchema", () => {
+  const valid = {
+    classId: uuid,
+    sourceWeekStartISO: "2026-05-18",
+    targetWeekStartISO: "2026-05-25",
+  };
+  it("parses valid input", () => {
+    expect(() => copyWeekInputSchema.parse(valid)).not.toThrow();
+  });
+  it("rejects source == target", () => {
+    expect(() => copyWeekInputSchema.parse({ ...valid, targetWeekStartISO: valid.sourceWeekStartISO })).toThrow();
+  });
+  it("rejects non-Monday weeks", () => {
+    expect(() => copyWeekInputSchema.parse({ ...valid, sourceWeekStartISO: "2026-05-19" })).toThrow();
+    expect(() => copyWeekInputSchema.parse({ ...valid, targetWeekStartISO: "2026-05-26" })).toThrow();
+  });
+});
+
+describe("upsertEnrollmentForecastInputSchema", () => {
+  const valid = { classId: uuid, date: "2026-05-18", expectedStudents: 12 };
+  it("parses a valid input", () => {
+    expect(() => upsertEnrollmentForecastInputSchema.parse(valid)).not.toThrow();
+  });
+  it("rejects negative expectedStudents", () => {
+    expect(() => upsertEnrollmentForecastInputSchema.parse({ ...valid, expectedStudents: -1 })).toThrow();
+  });
+  it("rejects non-integer expectedStudents", () => {
+    expect(() => upsertEnrollmentForecastInputSchema.parse({ ...valid, expectedStudents: 1.5 })).toThrow();
+  });
+});
+
+describe("deleteEnrollmentForecastInputSchema", () => {
+  it("parses a valid input", () => {
+    expect(() => deleteEnrollmentForecastInputSchema.parse({ classId: uuid, date: "2026-05-18" })).not.toThrow();
+  });
+  it("rejects bad date format", () => {
+    expect(() => deleteEnrollmentForecastInputSchema.parse({ classId: uuid, date: "2026/05/18" })).toThrow();
+  });
+});
+
+describe("enrollmentImportRowSchema", () => {
+  it("parses a valid row", () => {
+    expect(() => enrollmentImportRowSchema.parse({ date: "2026-05-18", expected_students: 12 })).not.toThrow();
+  });
+  it("accepts numeric strings (xlsx may return strings)", () => {
+    expect(() => enrollmentImportRowSchema.parse({ date: "2026-05-18", expected_students: "12" })).not.toThrow();
+  });
+  it("rejects negative students", () => {
+    expect(() => enrollmentImportRowSchema.parse({ date: "2026-05-18", expected_students: -3 })).toThrow();
+  });
+  it("rejects non-real date", () => {
+    expect(() => enrollmentImportRowSchema.parse({ date: "2026-02-30", expected_students: 12 })).toThrow();
+  });
+});
+
+describe("commitEnrollmentImportInputSchema", () => {
+  it("parses valid input", () => {
+    expect(() =>
+      commitEnrollmentImportInputSchema.parse({
+        classId: uuid,
+        sessionId: "any-string-id",
+        rows: [{ date: "2026-05-18", expected_students: 12 }],
+      }),
+    ).not.toThrow();
+  });
+  it("rejects empty rows", () => {
+    expect(() =>
+      commitEnrollmentImportInputSchema.parse({ classId: uuid, sessionId: "id", rows: [] }),
+    ).toThrow();
   });
 });

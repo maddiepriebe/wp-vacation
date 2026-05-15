@@ -94,6 +94,52 @@ export const moveShiftInputSchema = z
   })
   .superRefine(timeRangeRefine);
 
+export const saveAsTemplateInputSchema = z.object({
+  classId: uuid,
+  sourceWeekStartISO: mondayISO,
+  effectiveFromISO: mondayISO,
+  selectedShifts: z.array(
+    z.discriminatedUnion("source", [
+      z.object({ source: z.literal("template"), templateId: uuid }),
+      z.object({ source: z.literal("override"), shiftId: uuid }),
+    ]),
+  ),
+});
+
+export const copyWeekInputSchema = z
+  .object({
+    classId: uuid,
+    sourceWeekStartISO: mondayISO,
+    targetWeekStartISO: mondayISO,
+  })
+  .refine((d) => d.sourceWeekStartISO !== d.targetWeekStartISO, {
+    message: "Source and target weeks must differ",
+    path: ["targetWeekStartISO"],
+  });
+
+export const upsertEnrollmentForecastInputSchema = z.object({
+  classId: uuid,
+  date: isoDate,
+  expectedStudents: z.number().int().min(0),
+});
+
+export const deleteEnrollmentForecastInputSchema = z.object({
+  classId: uuid,
+  date: isoDate,
+});
+
+export const enrollmentImportRowSchema = z.object({
+  date: isoDate,
+  // xlsx may surface numeric cells as strings; coerce defensively.
+  expected_students: z.coerce.number().int().min(0),
+});
+
+export const commitEnrollmentImportInputSchema = z.object({
+  classId: uuid,
+  sessionId: z.string().min(1),
+  rows: z.array(enrollmentImportRowSchema).min(1),
+});
+
 export type CreateShiftInput = z.infer<typeof createShiftInputSchema>;
 export type UpdateShiftInput = z.infer<typeof updateShiftInputSchema>;
 export type DeleteShiftInput = z.infer<typeof deleteShiftInputSchema>;
@@ -101,3 +147,9 @@ export type CreateShiftTemplateInput = z.infer<typeof createShiftTemplateInputSc
 export type UpdateShiftTemplateInput = z.infer<typeof updateShiftTemplateInputSchema>;
 export type DeleteShiftTemplateInput = z.infer<typeof deleteShiftTemplateInputSchema>;
 export type MoveShiftInput = z.infer<typeof moveShiftInputSchema>;
+export type SaveAsTemplateInput = z.infer<typeof saveAsTemplateInputSchema>;
+export type CopyWeekInput = z.infer<typeof copyWeekInputSchema>;
+export type UpsertEnrollmentForecastInput = z.infer<typeof upsertEnrollmentForecastInputSchema>;
+export type DeleteEnrollmentForecastInput = z.infer<typeof deleteEnrollmentForecastInputSchema>;
+export type EnrollmentImportRow = z.infer<typeof enrollmentImportRowSchema>;
+export type CommitEnrollmentImportInput = z.infer<typeof commitEnrollmentImportInputSchema>;
