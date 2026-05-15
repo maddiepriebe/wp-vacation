@@ -2230,12 +2230,9 @@ export default async function ClassSchedulePage({
 }
 ```
 
-- [ ] **Step 2: Typecheck**
+- [ ] **Step 2: Do not typecheck or commit yet — combined with Task 11**
 
-Run: `pnpm typecheck`
-Expected: PASS. Will fail until `ScheduleClient` exists — that's Task 11. Leave the import; commit later.
-
-(Skip commit for now; combined with Task 11.)
+`pnpm typecheck` will fail here until `ScheduleClient` and the other `_components/*` exist (Task 11). Leave the import to `./_components/ScheduleClient` as-is, do not run typecheck, and do not commit `page.tsx` yet. Task 11 creates the components, Task 11 Step 3 runs `pnpm typecheck && pnpm lint` against the page + components together, and Task 11 Step 4 stages and commits both.
 
 ---
 
