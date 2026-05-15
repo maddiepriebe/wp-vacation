@@ -86,7 +86,7 @@ describe("resolveWeek", () => {
       const sources = out.map((s) => s.source).sort();
       expect(sources).toEqual(["override", "template"]);
       const tmpl = out.find((s) => s.source === "template");
-      expect(tmpl?.start_time).toBe("13:00");
+      expect(tmpl?.start_time).toBe("13:00:00");
     });
   });
 
