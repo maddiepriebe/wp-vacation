@@ -1,10 +1,10 @@
 "use server";
 
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, gte, lte, ne } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { runActionTx } from "@/lib/actions/transactions";
-import type { ActionResult } from "@/lib/actions/errors";
+import type { ActionResult, ConflictReason } from "@/lib/actions/errors";
 import { writeAuditLog } from "@/lib/audit/write";
 import {
   classes,
@@ -13,12 +13,17 @@ import {
   scheduleShifts,
 } from "@/db/schema";
 import { detectShiftConflicts } from "@/lib/schedule/conflicts";
+import { applyClosureRule, normTime } from "@/lib/schedule/closure";
+import { resolveWeek } from "@/lib/schedule/resolver";
+import { addDaysISO, todayET, weekEnd, weekStartOf } from "@/lib/dates";
 import {
+  copyWeekInputSchema,
   createShiftInputSchema,
   createShiftTemplateInputSchema,
   deleteShiftInputSchema,
   deleteShiftTemplateInputSchema,
   moveShiftInputSchema,
+  saveAsTemplateInputSchema,
   updateShiftInputSchema,
   updateShiftTemplateInputSchema,
 } from "@/lib/schedule/schemas";
@@ -527,4 +532,183 @@ export async function moveShiftAction(input: unknown): Promise<ActionResult<{ id
     revalidatePath(`/admin/classes/${existing.classId}/schedule`);
     return { ok: true, data: { id: data.shiftId } };
   });
+}
+
+export async function saveAsTemplateAction(input: unknown): Promise<ActionResult<{ classId: string; newTemplateIds: string[] }>> {
+  const admin = await requireAdmin();
+  const parsed = saveAsTemplateInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+
+  // L4: business validation — past-dated effectiveFromISO blocked.
+  if (data.effectiveFromISO < weekStartOf(todayET())) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "effectiveFromISO must be the current week's Monday or later" },
+    };
+  }
+
+  return runActionTx(
+    "template.save",
+    { classId: data.classId, sourceWeekStartISO: data.sourceWeekStartISO, effectiveFromISO: data.effectiveFromISO },
+    async (tx) => {
+      const [cls] = await tx.select({ id: classes.id }).from(classes).where(eq(classes.id, data.classId));
+      if (!cls) return { ok: false, error: { code: "class_missing", message: "Class not found" } };
+
+      // Resolve the source week through the same code path the dialog used.
+      const resolved = await resolveWeek(data.classId, data.sourceWeekStartISO);
+      const templateIds = new Set(resolved.filter((r) => r.source === "template").map((r) => (r as { template_id: string }).template_id));
+      const overrideIds = new Set(resolved.filter((r) => r.source === "override").map((r) => (r as { shift_id: string }).shift_id));
+
+      const missing: { source: "template" | "override"; id: string }[] = [];
+      for (const sel of data.selectedShifts) {
+        if (sel.source === "template" && !templateIds.has(sel.templateId)) missing.push({ source: "template", id: sel.templateId });
+        if (sel.source === "override" && !overrideIds.has(sel.shiftId)) missing.push({ source: "override", id: sel.shiftId });
+      }
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          error: {
+            code: "validation",
+            message: "Selected shifts were not present in the source week — refresh and retry",
+            fieldErrors: { selectedShifts: missing.map((m) => `${m.source}:${m.id}`) },
+          },
+        };
+      }
+
+      // Project each selected ResolvedShift to a candidate template row.
+      const candidates: {
+        employeeId: string;
+        dayOfWeek: number;
+        startTime: string;
+        endTime: string;
+      }[] = [];
+      const sourceShiftIds: string[] = [];
+      for (const sel of data.selectedShifts) {
+        const row = resolved.find((r) => {
+          if (sel.source === "template" && r.source === "template") return r.template_id === sel.templateId;
+          if (sel.source === "override" && r.source === "override") return r.shift_id === sel.shiftId;
+          return false;
+        });
+        if (!row) continue;
+        const dow = (() => {
+          const [y, m, d] = row.date.split("-").map(Number);
+          const js = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+          return js === 0 ? -1 : js - 1; // Mon=0..Fri=4
+        })();
+        candidates.push({
+          employeeId: row.employee_id,
+          dayOfWeek: dow,
+          startTime: normTime(row.start_time),
+          endTime: normTime(row.end_time),
+        });
+        if (sel.source === "override") sourceShiftIds.push(sel.shiftId);
+      }
+
+      // Closure: close currently-active templates for this class.
+      const { closedTemplateIds } = await applyClosureRule(tx, data.classId, data.effectiveFromISO);
+
+      // Conflict check inside the transaction, after closure.
+      // sameClassTemplates = the OTHER candidates in this set (after closure, no prior same-class templates remain active on/after effectiveFromISO).
+      // crossClassTemplates = employee's still-active templates in other classes on the same dayOfWeek.
+      const conflicts: ConflictReason[] = [];
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+
+        const crossClassTemplates = await tx
+          .select({
+            id: scheduleShiftTemplates.id,
+            classId: scheduleShiftTemplates.classId,
+            employeeId: scheduleShiftTemplates.employeeId,
+            dayOfWeek: scheduleShiftTemplates.dayOfWeek,
+            startTime: scheduleShiftTemplates.startTime,
+            endTime: scheduleShiftTemplates.endTime,
+            effectiveFrom: scheduleShiftTemplates.effectiveFrom,
+            effectiveUntil: scheduleShiftTemplates.effectiveUntil,
+          })
+          .from(scheduleShiftTemplates)
+          .where(
+            and(
+              ne(scheduleShiftTemplates.classId, data.classId),
+              eq(scheduleShiftTemplates.employeeId, c.employeeId),
+              eq(scheduleShiftTemplates.dayOfWeek, c.dayOfWeek),
+            ),
+          );
+
+        const sameClassCandidatesAsTemplates: TemplateLike[] = candidates
+          .map((other, j) => ({
+            id: `candidate-${j}`,
+            classId: data.classId,
+            employeeId: other.employeeId,
+            dayOfWeek: other.dayOfWeek,
+            startTime: other.startTime,
+            endTime: other.endTime,
+            effectiveFrom: data.effectiveFromISO,
+            effectiveUntil: null,
+          }))
+          .filter((_, j) => j !== i);
+
+        const c_conflicts = detectShiftConflicts(
+          {
+            kind: "template",
+            classId: data.classId,
+            employeeId: c.employeeId,
+            dayOfWeek: c.dayOfWeek,
+            startTime: c.startTime,
+            endTime: c.endTime,
+            effectiveFromISO: data.effectiveFromISO,
+          },
+          {
+            crossClassShifts: [],
+            crossClassTemplates,
+            sameClassTemplates: sameClassCandidatesAsTemplates,
+          },
+        );
+        conflicts.push(...c_conflicts);
+      }
+      if (conflicts.length > 0) {
+        return { ok: false, error: { code: "conflict", message: "Save-as-template would conflict", conflicts } };
+      }
+
+      // Insert.
+      const newTemplateIds: string[] = [];
+      for (const c of candidates) {
+        const [inserted] = await tx
+          .insert(scheduleShiftTemplates)
+          .values({
+            classId: data.classId,
+            employeeId: c.employeeId,
+            dayOfWeek: c.dayOfWeek,
+            startTime: c.startTime,
+            endTime: c.endTime,
+            effectiveFrom: data.effectiveFromISO,
+            effectiveUntil: null,
+          })
+          .returning({ id: scheduleShiftTemplates.id });
+        newTemplateIds.push(inserted.id);
+      }
+
+      await writeAuditLog(tx, {
+        actorAdminId: admin.id,
+        action: "template.save",
+        targetId: data.classId,
+        payload: {
+          classId: data.classId,
+          sourceWeekStartISO: data.sourceWeekStartISO,
+          effectiveFromISO: data.effectiveFromISO,
+          newTemplateIds,
+          closedTemplateIds,
+          sourceShiftIds,
+        },
+      });
+
+      revalidatePath(`/admin/classes/${data.classId}/schedule`);
+      return { ok: true, data: { classId: data.classId, newTemplateIds } };
+    },
+  );
 }

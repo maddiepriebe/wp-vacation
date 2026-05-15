@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { auditLog, scheduleShifts, scheduleShiftTemplates } from "@/db/schema";
 import { withTx } from "@/test/with-tx";
 import { makeAdmin, makeClass, makeEmployee, makeTemplate } from "@/test/fixtures";
@@ -580,6 +580,226 @@ describe("moveShiftAction", () => {
       // (T1, emp, date) now refers to Tuesday — which has no template instance,
       // so nothing visible is suppressed. Acceptable v1 behavior.
       expect(row.sourceTemplateId).toBe(t.id);
+    });
+  });
+});
+
+import { saveAsTemplateAction } from "@/app/(admin)/admin/classes/[id]/actions";
+
+describe("saveAsTemplateAction", () => {
+  it("happy path: closes prior templates and inserts new ones with effective_from = effectiveFromISO", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      currentAdminId.value = admin.id;
+
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [{ source: "template", templateId: t.id }],
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+
+      const allRows = await tx.select().from(scheduleShiftTemplates).where(eq(scheduleShiftTemplates.classId, cls.id));
+      const closed = allRows.find((r) => r.id === t.id);
+      expect(closed?.effectiveUntil).toBe("2026-05-24");
+      const fresh = allRows.find((r) => r.effectiveFrom === "2026-05-25");
+      expect(fresh).toBeTruthy();
+      expect(fresh?.effectiveUntil).toBeNull();
+      expect(fresh?.dayOfWeek).toBe(0);
+
+      const [audit] = await tx.select().from(auditLog).where(eq(auditLog.action, "template.save"));
+      expect(audit.entityType).toBe("template");
+      expect(audit.entityId).toBe(cls.id);
+      expect(audit.payload).toMatchObject({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+      });
+    });
+  });
+
+  it("includes selected override-source rows projected to templates", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      // Existing template + override that replaces it 9-11
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      const [shift] = await tx
+        .insert(scheduleShifts)
+        .values({
+          classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+          startTime: "09:00", endTime: "11:00", sourceTemplateId: t.id,
+        })
+        .returning();
+      currentAdminId.value = admin.id;
+
+      // Admin selects only the override (un-ticks the template) — bakes 9-11 in.
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [{ source: "override", shiftId: shift.id }],
+      });
+
+      expect(result.ok).toBe(true);
+      const fresh = await tx
+        .select()
+        .from(scheduleShiftTemplates)
+        .where(
+          and(
+            eq(scheduleShiftTemplates.classId, cls.id),
+            eq(scheduleShiftTemplates.effectiveFrom, "2026-05-25"),
+          ),
+        );
+      expect(fresh).toHaveLength(1);
+      expect(fresh[0].startTime).toBe("09:00:00");
+      expect(fresh[0].endTime).toBe("11:00:00");
+    });
+  });
+
+  it("validates selection against the source week, not the effective week", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      currentAdminId.value = admin.id;
+
+      // Source = W1 (2026-05-18); effective = W2 (2026-05-25). Template t expands in both.
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [{ source: "template", templateId: t.id }],
+      });
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it("rejects empty selection — closure still fires, but no new templates inserted", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      currentAdminId.value = admin.id;
+
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [],
+      });
+      expect(result.ok).toBe(true);
+
+      const closed = await tx
+        .select()
+        .from(scheduleShiftTemplates)
+        .where(eq(scheduleShiftTemplates.id, t.id));
+      expect(closed[0].effectiveUntil).toBe("2026-05-24");
+      const fresh = await tx
+        .select()
+        .from(scheduleShiftTemplates)
+        .where(
+          and(
+            eq(scheduleShiftTemplates.classId, cls.id),
+            eq(scheduleShiftTemplates.effectiveFrom, "2026-05-25"),
+          ),
+        );
+      expect(fresh).toHaveLength(0);
+    });
+  });
+
+  it("rejects stale selection (template id not in source-week resolved set)", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [{ source: "template", templateId: "00000000-0000-0000-0000-000000000999" }],
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+
+  it("rejects internally overlapping selected shifts (rule c) within the same candidate set", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      // Template 8-12 plus a standalone override 9-11 on the same Monday.
+      // Both surface in the resolver (no sourceTemplateId → no suppression).
+      // Admin selects BOTH → rule c overlap inside the candidate set.
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      const [override] = await tx
+        .insert(scheduleShifts)
+        .values({
+          classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+          startTime: "09:00", endTime: "11:00", sourceTemplateId: null,
+        })
+        .returning();
+      currentAdminId.value = admin.id;
+
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-25",
+        selectedShifts: [
+          { source: "template", templateId: t.id },
+          { source: "override", shiftId: override.id },
+        ],
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("conflict");
+        expect(result.error.conflicts.some((c) => c.rule === "c")).toBe(true);
+      }
+    });
+  });
+
+  it("rejects effectiveFromISO before this week's Monday", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+
+      // 2026-05-15 is today (per project clock); 2026-05-04 is a past Monday.
+      const result = await saveAsTemplateAction({
+        classId: cls.id,
+        sourceWeekStartISO: "2026-05-18",
+        effectiveFromISO: "2026-05-04",
+        selectedShifts: [],
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
     });
   });
 });
