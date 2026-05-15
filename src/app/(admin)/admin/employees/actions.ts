@@ -16,7 +16,8 @@ import {
   computeVacationEntitlement,
 } from "@/lib/balances/entitlements";
 import { writeAuditLog } from "@/lib/audit/write";
-import { todayET } from "@/lib/dates";
+import { daysInRange, isISODateString, todayET } from "@/lib/dates";
+import { addYears, parseISO } from "date-fns";
 import { validateEmployeeImportSheet } from "@/lib/sheets/employee-import";
 import type { ParsedRow } from "@/lib/sheets/parse";
 import { inviteUser, resendInvite } from "@/lib/clerk-invite";
@@ -502,5 +503,146 @@ export async function resendInviteAction(
       ok: true,
       data: { invitationId: resendResult.data.invitationId },
     };
+  });
+}
+
+const historicalUsageInputSchema = z
+  .object({
+    employeeId: z.string().uuid(),
+    // Guardrail E: balance_kind must match Phase 1's enum exactly.
+    balanceKind: z.enum(["vacation", "personal"]),
+    startDate: z.string().refine(isISODateString, "Must be a real YYYY-MM-DD date"),
+    endDate: z.string().refine(isISODateString, "Must be a real YYYY-MM-DD date"),
+    note: z.string().optional(),
+  })
+  .refine((d) => d.startDate <= d.endDate, {
+    message: "startDate must be on or before endDate",
+    path: ["startDate"],
+  });
+
+function countWeekdays(startISO: string, endISO: string): number {
+  let count = 0;
+  for (const iso of daysInRange(startISO, endISO)) {
+    const d = parseISO(iso);
+    const dow = d.getUTCDay();
+    if (dow >= 1 && dow <= 5) count++;
+  }
+  return count;
+}
+
+function currentAnniversaryYearRange(
+  anniversaryISO: string,
+  todayISO: string,
+): [string, string] {
+  const anniversary = parseISO(anniversaryISO);
+  const today = parseISO(todayISO);
+  // Walk forward year by year until the next anniversary is past today —
+  // that gives the start of the current anniversary year cycle.
+  let start = new Date(anniversary);
+  while (true) {
+    const next = addYears(start, 1);
+    if (next > today) break;
+    start = next;
+  }
+  const end = addYears(start, 1);
+  end.setUTCDate(end.getUTCDate() - 1);
+  return [
+    start.toISOString().slice(0, 10),
+    end.toISOString().slice(0, 10),
+  ];
+}
+
+export async function recordHistoricalUsageAction(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = historicalUsageInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: {
+        code: "validation",
+        message: "Invalid input",
+        fieldErrors: parsed.error.flatten().fieldErrors,
+      },
+    };
+  }
+  const data = parsed.data;
+
+  return runActionTx("employee.historical_usage", data, async (tx) => {
+    const [emp] = await tx
+      .select()
+      .from(employees)
+      .where(eq(employees.id, data.employeeId));
+    if (!emp) {
+      return {
+        ok: false,
+        error: { code: "not_found", message: "Employee not found" },
+      };
+    }
+
+    const today = todayET();
+    const [yrStart, yrEnd] = currentAnniversaryYearRange(
+      emp.anniversaryDate,
+      today,
+    );
+    if (data.startDate < yrStart || data.endDate > yrEnd) {
+      return {
+        ok: false,
+        error: {
+          code: "validation",
+          message: `Dates must fall within the current anniversary year (${yrStart} to ${yrEnd})`,
+          fieldErrors: { startDate: ["Out of anniversary year range"] },
+        },
+      };
+    }
+
+    const weekdays = countWeekdays(data.startDate, data.endDate);
+    const hours = weekdays * 8;
+
+    const [txn] = await tx
+      .insert(balanceTransactions)
+      .values({
+        employeeId: emp.id,
+        balanceKind: data.balanceKind,
+        // Guardrail E: negative delta — this records hours already drawn.
+        deltaHours: String(-hours),
+        source: "historical_usage",
+        adminId: admin.id,
+        note:
+          data.note ??
+          `Historical usage ${data.startDate} to ${data.endDate}`,
+      })
+      .returning();
+
+    const denormColumn =
+      data.balanceKind === "vacation"
+        ? employees.vacationHoursBalance
+        : employees.personalHoursBalance;
+    const setClause =
+      data.balanceKind === "vacation"
+        ? { vacationHoursBalance: sql`${denormColumn} - ${hours}` }
+        : { personalHoursBalance: sql`${denormColumn} - ${hours}` };
+    await tx
+      .update(employees)
+      .set(setClause)
+      .where(eq(employees.id, emp.id));
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "employee.historical_usage_recorded",
+      targetId: emp.id,
+      // Guardrail E: payload carries all four fields so the adjustment can
+      // be reconstructed forensically.
+      payload: {
+        balanceKind: data.balanceKind,
+        startDate: data.startDate,
+        endDate: data.endDate,
+        hours,
+      },
+    });
+
+    revalidatePath(`/admin/employees/${emp.id}`);
+    return { ok: true, data: { id: txn.id } };
   });
 }

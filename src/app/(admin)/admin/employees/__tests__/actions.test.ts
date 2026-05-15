@@ -34,6 +34,7 @@ import {
   commitEmployeeImportAction,
   createEmployeeAction,
   parseEmployeeImportAction,
+  recordHistoricalUsageAction,
   resendInviteAction,
   sendInviteAction,
 } from "@/app/(admin)/admin/employees/actions";
@@ -290,7 +291,7 @@ describe("commitEmployeeImportAction", () => {
   it("inserts all rows with balances and a single summary audit", async () => {
     await withTx(async (tx) => {
       const admin = await makeAdmin(tx);
-      const cls = await makeClass(tx, { name: "Pre-K" });
+      await makeClass(tx, { name: "Pre-K" });
       currentAdminId.value = admin.id;
 
       const result = await commitEmployeeImportAction({
@@ -709,6 +710,197 @@ describe("resendInviteAction", () => {
       });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+});
+
+describe("recordHistoricalUsageAction", () => {
+  it("writes a negative balance_transaction and decrements the bucket", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2020-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      // Mon-Fri of one week = 5 weekdays × 8h = 40h.
+      const result = await recordHistoricalUsageAction({
+        employeeId: empResult.data.id,
+        balanceKind: "vacation",
+        startDate: "2026-05-11",
+        endDate: "2026-05-15",
+      });
+      expect(result.ok).toBe(true);
+
+      const [emp] = await tx
+        .select()
+        .from(employees)
+        .where(eq(employees.id, empResult.data.id));
+      expect(Number(emp.vacationHoursBalance)).toBe(160 - 40);
+
+      const [txn] = await tx
+        .select()
+        .from(balanceTransactions)
+        .where(
+          and(
+            eq(balanceTransactions.employeeId, empResult.data.id),
+            eq(balanceTransactions.source, "historical_usage"),
+          ),
+        );
+      expect(Number(txn.deltaHours)).toBe(-40);
+    });
+  });
+
+  it("ignores weekends in the hour count", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2020-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      // Fri-Mon spans 2 weekdays (Fri + Mon) × 8 = 16h.
+      const result = await recordHistoricalUsageAction({
+        employeeId: empResult.data.id,
+        balanceKind: "vacation",
+        startDate: "2026-05-15",
+        endDate: "2026-05-18",
+      });
+      expect(result.ok).toBe(true);
+
+      const [emp] = await tx
+        .select()
+        .from(employees)
+        .where(eq(employees.id, empResult.data.id));
+      expect(Number(emp.vacationHoursBalance)).toBe(160 - 16);
+    });
+  });
+
+  it("rejects start > end", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2020-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      const result = await recordHistoricalUsageAction({
+        employeeId: empResult.data.id,
+        balanceKind: "vacation",
+        startDate: "2026-05-20",
+        endDate: "2026-05-10",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+
+  it("rejects dates outside the current anniversary year", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2020-08-01",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      const result = await recordHistoricalUsageAction({
+        employeeId: empResult.data.id,
+        balanceKind: "vacation",
+        startDate: "2025-01-15", // before the current anniversary year
+        endDate: "2025-01-19",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+
+  it("returns not_found for nonexistent employee", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const result = await recordHistoricalUsageAction({
+        employeeId: "00000000-0000-0000-0000-000000000000",
+        balanceKind: "vacation",
+        startDate: "2026-05-11",
+        endDate: "2026-05-15",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("not_found");
+    });
+  });
+
+  it("writes an audit row with all four payload fields", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const empResult = await createEmployeeAction({
+        first_name: "Maria",
+        last_name: "L.",
+        email: "maria@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2020-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!empResult.ok) throw new Error("setup");
+
+      const result = await recordHistoricalUsageAction({
+        employeeId: empResult.data.id,
+        balanceKind: "personal",
+        startDate: "2026-05-11",
+        endDate: "2026-05-12",
+      });
+      expect(result.ok).toBe(true);
+
+      const audits = await tx
+        .select()
+        .from(auditLog)
+        .where(
+          and(
+            eq(auditLog.action, "employee.historical_usage_recorded"),
+            eq(auditLog.entityId, empResult.data.id),
+          ),
+        );
+      expect(audits).toHaveLength(1);
+      const payload = audits[0].payload as Record<string, unknown>;
+      expect(payload.balanceKind).toBe("personal");
+      expect(payload.startDate).toBe("2026-05-11");
+      expect(payload.endDate).toBe("2026-05-12");
+      expect(payload.hours).toBe(16); // Mon + Tue × 8h
     });
   });
 });
