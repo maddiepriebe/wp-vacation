@@ -24,6 +24,7 @@ vi.mock("@/lib/auth", () => ({
 }));
 
 import {
+  commitEmployeeImportAction,
   createEmployeeAction,
   parseEmployeeImportAction,
 } from "@/app/(admin)/admin/employees/actions";
@@ -271,6 +272,199 @@ describe("parseEmployeeImportAction", () => {
       const result = await parseEmployeeImportAction(new FormData());
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+});
+
+describe("commitEmployeeImportAction", () => {
+  it("inserts all rows with balances and a single summary audit", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx, { name: "Pre-K" });
+      currentAdminId.value = admin.id;
+
+      const result = await commitEmployeeImportAction({
+        sessionId: crypto.randomUUID(),
+        rows: [
+          {
+            first_name: "Maria",
+            last_name: "L.",
+            email: "maria@example.com",
+            role_in_class: "teacher",
+            default_class_name: "Pre-K",
+            anniversary_date: "2020-01-15", // 6+ years
+            scheduled_hours_per_week: 40,
+          },
+          {
+            first_name: "Jess",
+            last_name: "T.",
+            email: "jess@example.com",
+            role_in_class: "assistant_teacher",
+            default_class_name: "pre-k", // case-insensitive
+            anniversary_date: "2025-11-15", // ≥ 6 months as of 2026-05-15+
+            scheduled_hours_per_week: 40,
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.data.ids).toHaveLength(2);
+
+      const inserted = await tx.select().from(employees);
+      expect(
+        inserted.filter((e) =>
+          ["maria@example.com", "jess@example.com"].includes(e.email),
+        ),
+      ).toHaveLength(2);
+
+      const audits = await tx
+        .select()
+        .from(auditLog)
+        .where(eq(auditLog.action, "employee.import"));
+      expect(audits).toHaveLength(1);
+      expect((audits[0].payload as { count: number }).count).toBe(2);
+    });
+  });
+
+  it("fails the whole transaction with class_missing if a row's class is gone", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const result = await commitEmployeeImportAction({
+        sessionId: crypto.randomUUID(),
+        rows: [
+          {
+            first_name: "Maria",
+            last_name: "L.",
+            email: "no-class-row@example.com",
+            role_in_class: "teacher",
+            default_class_name: "ClassThatDoesNotExist",
+            anniversary_date: "2025-01-15",
+            scheduled_hours_per_week: 40,
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("class_missing");
+
+      const inserted = await tx
+        .select()
+        .from(employees)
+        .where(eq(employees.email, "no-class-row@example.com"));
+      expect(inserted).toHaveLength(0);
+    });
+  });
+
+  it("rejects invalid rows via re-parse", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const result = await commitEmployeeImportAction({
+        sessionId: crypto.randomUUID(),
+        rows: [
+          {
+            first_name: "Bad",
+            last_name: "Role",
+            email: "bad@example.com",
+            role_in_class: "manager" as never,
+            default_class_name: "Pre-K",
+            anniversary_date: "2025-01-15",
+            scheduled_hours_per_week: 40,
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
+    });
+  });
+
+  it("rejects duplicate emails within the same import", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      await makeClass(tx, { name: "Pre-K" });
+      currentAdminId.value = admin.id;
+
+      const result = await commitEmployeeImportAction({
+        sessionId: crypto.randomUUID(),
+        rows: [
+          {
+            first_name: "Maria",
+            last_name: "L.",
+            email: "dup@example.com",
+            role_in_class: "teacher",
+            default_class_name: "Pre-K",
+            anniversary_date: "2025-01-15",
+            scheduled_hours_per_week: 40,
+          },
+          {
+            first_name: "Maria2",
+            last_name: "L.",
+            email: "dup@example.com",
+            role_in_class: "teacher",
+            default_class_name: "Pre-K",
+            anniversary_date: "2025-01-15",
+            scheduled_hours_per_week: 40,
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("validation");
+        if (result.error.code === "validation") {
+          expect(result.error.message).toBe("Duplicate emails within import");
+        }
+      }
+    });
+  });
+
+  it("rejects when an email already exists in the database", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx, { name: "Pre-K" });
+      currentAdminId.value = admin.id;
+
+      // Pre-existing employee with the same email (case different).
+      const pre = await createEmployeeAction({
+        first_name: "Pre",
+        last_name: "Existing",
+        email: "exists@example.com",
+        role_in_class: "teacher",
+        default_class_id: cls.id,
+        anniversary_date: "2025-01-15",
+        scheduled_hours_per_week: 40,
+      });
+      if (!pre.ok) throw new Error("setup");
+
+      const result = await commitEmployeeImportAction({
+        sessionId: crypto.randomUUID(),
+        rows: [
+          {
+            first_name: "Maria",
+            last_name: "L.",
+            email: "EXISTS@example.com",
+            role_in_class: "teacher",
+            default_class_name: "Pre-K",
+            anniversary_date: "2025-01-15",
+            scheduled_hours_per_week: 40,
+          },
+        ],
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("validation");
+        if (result.error.code === "validation") {
+          expect(result.error.message).toBe(
+            "One or more emails already exist",
+          );
+        }
+      }
     });
   });
 });
