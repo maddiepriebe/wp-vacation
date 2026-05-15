@@ -11,7 +11,10 @@ vi.mock("@/lib/auth", () => ({
   requireAdmin: async () => ({ id: currentAdminId.value }),
 }));
 
-import { createShiftAction } from "@/app/(admin)/admin/classes/[id]/actions";
+import {
+  createShiftAction,
+  updateShiftAction,
+} from "@/app/(admin)/admin/classes/[id]/actions";
 
 describe("createShiftAction", () => {
   it("inserts a standalone shift and writes shift.create audit", async () => {
@@ -143,6 +146,90 @@ describe("createShiftAction", () => {
 
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error.code).toBe("class_missing");
+    });
+  });
+});
+
+describe("updateShiftAction", () => {
+  it("updates times and writes audit", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+
+      const create = await createShiftAction({
+        classId: cls.id,
+        employeeId: emp.id,
+        date: "2026-05-18",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await updateShiftAction({
+        shiftId: create.data.id,
+        startTime: "08:15",
+        endTime: "12:15",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(row.startTime).toBe("08:15:00");
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.update"));
+      expect(audits).toHaveLength(1);
+      expect(audits[0].payload).toMatchObject({ before: { startTime: "08:00:00" }, after: { startTime: "08:15" } });
+    });
+  });
+
+  it("self-exclusion: updating to current values does not flag own row as conflict", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18", startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+      const result = await updateShiftAction({ shiftId: create.data.id, startTime: "08:00", endTime: "12:00" });
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it("returns not_found for missing shift", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+      const result = await updateShiftAction({ shiftId: "00000000-0000-0000-0000-000000000000", startTime: "08:00", endTime: "12:00" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("not_found");
+    });
+  });
+
+  it("changing employeeId re-fetches context for the new employee", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const clsA = await makeClass(tx);
+      const clsB = await makeClass(tx);
+      const e1 = await makeEmployee(tx, { defaultClassId: clsA.id });
+      const e2 = await makeEmployee(tx, { defaultClassId: clsB.id });
+      currentAdminId.value = admin.id;
+
+      // e2 already has a shift in clsB at the same time.
+      await createShiftAction({
+        classId: clsB.id, employeeId: e2.id, date: "2026-05-18", startTime: "08:00", endTime: "12:00",
+      });
+
+      // Create a shift for e1 in clsA, then try to reassign to e2 → conflict with e2's clsB shift.
+      const create = await createShiftAction({
+        classId: clsA.id, employeeId: e1.id, date: "2026-05-18", startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await updateShiftAction({ shiftId: create.data.id, employeeId: e2.id });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("conflict");
     });
   });
 });

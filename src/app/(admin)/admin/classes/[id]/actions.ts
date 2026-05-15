@@ -15,6 +15,7 @@ import {
 import { detectShiftConflicts } from "@/lib/schedule/conflicts";
 import {
   createShiftInputSchema,
+  updateShiftInputSchema,
 } from "@/lib/schedule/schemas";
 import type { TemplateLike, ShiftLike } from "@/lib/schedule/types";
 
@@ -140,5 +141,77 @@ export async function createShiftAction(input: unknown): Promise<ActionResult<{ 
 
     revalidatePath(`/admin/classes/${data.classId}/schedule`);
     return { ok: true, data: { id: row.id } };
+  });
+}
+
+export async function updateShiftAction(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = updateShiftInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors } };
+  }
+  const data = parsed.data;
+
+  return runActionTx("shift.update", { shiftId: data.shiftId }, async (tx) => {
+    const [existing] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, data.shiftId));
+    if (!existing) return { ok: false, error: { code: "not_found", message: "Shift not found" } };
+
+    const next = {
+      employeeId: data.employeeId ?? existing.employeeId,
+      startTime: data.startTime ?? existing.startTime,
+      endTime: data.endTime ?? existing.endTime,
+    };
+
+    const ctx = await loadClassesEmployeesTemplatesForShift(tx, {
+      classId: existing.classId,
+      employeeId: next.employeeId,
+      date: existing.date,
+    });
+
+    const conflicts = detectShiftConflicts(
+      {
+        kind: "shift",
+        classId: existing.classId,
+        employeeId: next.employeeId,
+        date: existing.date,
+        startTime: next.startTime,
+        endTime: next.endTime,
+      },
+      {
+        crossClassShifts: ctx.crossClassShifts,
+        crossClassTemplates: [],
+        sameClassTemplates: ctx.sameClassTemplates,
+        excludeShiftId: data.shiftId,
+        // If the existing row replaces a template, keep excluding that template from
+        // rule-(c) checks for the post-update candidate.
+        excludeTemplateId: existing.sourceTemplateId ?? undefined,
+      },
+    );
+    if (conflicts.length > 0) {
+      return { ok: false, error: { code: "conflict", message: "Shift conflicts detected", conflicts } };
+    }
+
+    await tx
+      .update(scheduleShifts)
+      .set({
+        employeeId: next.employeeId,
+        startTime: next.startTime,
+        endTime: next.endTime,
+        updatedAt: new Date(),
+      })
+      .where(eq(scheduleShifts.id, data.shiftId));
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "shift.update",
+      targetId: data.shiftId,
+      payload: {
+        before: { employeeId: existing.employeeId, startTime: existing.startTime, endTime: existing.endTime },
+        after: { employeeId: next.employeeId, startTime: next.startTime, endTime: next.endTime },
+      },
+    });
+
+    revalidatePath(`/admin/classes/${existing.classId}/schedule`);
+    return { ok: true, data: { id: data.shiftId } };
   });
 }
