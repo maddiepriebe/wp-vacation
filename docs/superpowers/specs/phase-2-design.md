@@ -1118,7 +1118,7 @@ type AuditLogRow = {
 
 **Action namespace inventory** (Phase 2):
 
-`employee.create`, `employee.import`, `employee.invite_sent`, `employee.invite_resent`, `employee.historical_usage_recorded`, `shift.create`, `shift.update`, `shift.delete`, `template.create`, `template.update`, `template.delete`, `template.save`, `week.copy`, `enrollment.upsert`, `enrollment.delete`, `enrollment.import`.
+`employee.create`, `employee.import`, `employee.invite_sent`, `employee.invite_resent`, `employee.historical_usage_recorded`, `shift.create`, `shift.update`, `shift.move`, `shift.delete`, `template.create`, `template.update`, `template.delete`, `template.save`, `week.copy`, `enrollment.upsert`, `enrollment.delete`, `enrollment.import`.
 
 **Payload rules:**
 

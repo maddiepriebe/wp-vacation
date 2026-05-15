@@ -351,6 +351,36 @@ describe("self-exclusion", () => {
     expect(detectShiftConflicts(baseTemplate, ctx)).toEqual([]);
   });
 });
+
+describe("replacement override + parent template interaction", () => {
+  it("a replacement override candidate does not conflict with the template it replaces (passed via excludeTemplateId)", () => {
+    // Setup: an override is being created with sourceTemplateId = T1. The caller passes
+    // sameClassTemplates with T1 and excludeTemplateId = T1 to indicate self-suppression.
+    const ctx: ConflictContext = {
+      ...emptyCtx,
+      excludeTemplateId: "T1",
+      sameClassTemplates: [
+        { id: "T1", classId: "class-a", employeeId: "emp-1", dayOfWeek: 0, startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-01-01", effectiveUntil: null },
+      ],
+    };
+    // The override would normally trigger rule (c) with T1, but excludeTemplateId suppresses it.
+    expect(detectShiftConflicts(baseShift, ctx)).toEqual([]);
+  });
+
+  it("the same replacement override still conflicts with a different overlapping template T2", () => {
+    const ctx: ConflictContext = {
+      ...emptyCtx,
+      excludeTemplateId: "T1",
+      sameClassTemplates: [
+        { id: "T1", classId: "class-a", employeeId: "emp-1", dayOfWeek: 0, startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-01-01", effectiveUntil: null },
+        { id: "T2", classId: "class-a", employeeId: "emp-1", dayOfWeek: 0, startTime: "10:00", endTime: "14:00", effectiveFrom: "2026-01-01", effectiveUntil: null },
+      ],
+    };
+    const out = detectShiftConflicts(baseShift, ctx);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ rule: "c", otherTemplateId: "T2" });
+  });
+});
 ```
 
 - [ ] **Step 2: Run; confirm fail**
@@ -1389,6 +1419,10 @@ export async function createShiftAction(input: unknown): Promise<ActionResult<{ 
         crossClassShifts: ctx.crossClassShifts,
         crossClassTemplates: [],
         sameClassTemplates: ctx.sameClassTemplates,
+        // When creating a replacement override, exclude its parent template from
+        // rule-(c) checks — the override is replacing T1 for this (employee, date),
+        // not conflicting with it. Resolver enforces the actual suppression at read time.
+        excludeTemplateId: data.sourceTemplateId ?? undefined,
       },
     );
     if (conflicts.length > 0) {
@@ -1591,6 +1625,9 @@ export async function updateShiftAction(input: unknown): Promise<ActionResult<{ 
         crossClassTemplates: [],
         sameClassTemplates: ctx.sameClassTemplates,
         excludeShiftId: data.shiftId,
+        // If the existing row replaces a template, keep excluding that template from
+        // rule-(c) checks for the post-update candidate.
+        excludeTemplateId: existing.sourceTemplateId ?? undefined,
       },
     );
     if (conflicts.length > 0) {
@@ -2850,15 +2887,344 @@ git commit -m "feat(classes/schedule): ModeToggle + WeekNavigator polish"
 
 ---
 
-## Task 15: Wire drag-to-move
+## Task 15: Build `moveShiftAction` (atomic) + wire drag-to-move
 
 **Files:**
-- Modify: `_components/WeekGrid.tsx`
-- Modify: `_components/ShiftBlock.tsx`
+- Modify: `src/lib/schedule/schemas.ts` — add `moveShiftInputSchema`.
+- Modify: `src/app/(admin)/admin/classes/[id]/actions.ts` — add `moveShiftAction`.
+- Modify: `src/app/(admin)/admin/classes/__tests__/actions.test.ts` — add `moveShiftAction` tests.
+- Modify: `src/app/(admin)/admin/classes/[id]/schedule/_components/WeekGrid.tsx`, `ShiftBlock.tsx` — drag handlers.
 
-Drag a `ShiftBlock` from one date cell to another → calls `updateShiftAction` for overrides (week mode) or shows a "templates aren't draggable; edit them via the dialog" hint for template-mode rows. Preserves duration.
+### Why a dedicated action
 
-- [ ] **Step 1: Add HTML5 drag handlers to ShiftBlock**
+The earlier draft of this task did **delete-then-create**, which could lose the original shift if the destination raised a conflict. Unacceptable. The fix: a new `moveShiftAction` that does a **single atomic UPDATE** of `date`, `start_time`, `end_time`, gated by an up-front conflict check. If conflict, return `{ ok: false, error: { code: 'conflict' } }` and leave the original row untouched.
+
+`updateShiftAction` keeps `date` immutable per Task 7 (its conflict-check architecture assumes a single date and would need broader rework to allow date changes). `moveShiftAction` is the explicit "this changes the date" affordance and reuses the same `ShiftCandidate` conflict-check shape with a different field set.
+
+**Audit namespace addition:** `shift.move`. Plan 4 / spec §7.3 inventory updates to include it. `entityType` is derived from the prefix as usual → `"shift"`.
+
+### Drag UX contract (text grid)
+
+The WeekGrid is a date × employee text table (no time axis). The natural drag affordance is across-day:
+
+- **Same-cell drop** (date and employee unchanged): no-op. The drop handler exits without calling any action.
+- **Different-date drop, same employee**: call `moveShiftAction({ shiftId, date: targetDate, startTime, endTime })` with the original times. The action does the conflict check + atomic UPDATE.
+- **Different-employee drop**: out of scope for v1 drag (the dialog handles employee reassignment via `updateShiftAction`).
+- **Conflict on destination**: `ConflictModal` opens; the original row is untouched (UPDATE never ran).
+- **No optimistic UI**: the grid is server-rendered. The shift visibly stays in its source cell until `router.refresh()` re-fetches; if the action fails, no refresh, no movement, no "revert" needed.
+
+Same-date time changes (if a timeline-style grid is added later) would call `updateShiftAction` per spec §5.5. Plan 3's text grid doesn't surface that affordance.
+
+Only `override` shifts are draggable. Template-derived slots edit via the dialog (which writes a replacement override).
+
+- [ ] **Step 1: Add `moveShiftInputSchema` to `src/lib/schedule/schemas.ts`**
+
+Append:
+
+```ts
+export const moveShiftInputSchema = z
+  .object({
+    shiftId: uuid,
+    date: isoDate,
+    startTime: timeStr,
+    endTime: timeStr,
+  })
+  .superRefine(timeRangeRefine);
+
+export type MoveShiftInput = z.infer<typeof moveShiftInputSchema>;
+```
+
+Add a quick test to `schemas.test.ts`:
+
+```ts
+import { moveShiftInputSchema } from "@/lib/schedule/schemas";
+
+describe("moveShiftInputSchema", () => {
+  const valid = {
+    shiftId: "00000000-0000-0000-0000-000000000001",
+    date: "2026-05-19",
+    startTime: "08:00",
+    endTime: "12:00",
+  };
+  it("parses a valid input", () => {
+    expect(() => moveShiftInputSchema.parse(valid)).not.toThrow();
+  });
+  it("rejects start >= end", () => {
+    expect(() => moveShiftInputSchema.parse({ ...valid, startTime: "12:00", endTime: "08:00" })).toThrow();
+  });
+  it("rejects bad date", () => {
+    expect(() => moveShiftInputSchema.parse({ ...valid, date: "2026-02-30" })).toThrow();
+  });
+});
+```
+
+Run: `pnpm test:run src/lib/schedule/__tests__/schemas.test.ts`
+Expected: PASS (16 total now in schemas.test.ts).
+
+- [ ] **Step 2: Write the failing `moveShiftAction` tests**
+
+Append to `src/app/(admin)/admin/classes/__tests__/actions.test.ts`:
+
+```ts
+import { moveShiftAction } from "@/app/(admin)/admin/classes/[id]/actions";
+
+describe("moveShiftAction", () => {
+  it("across-day move atomically updates the existing shift", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-19",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(row.date).toBe("2026-05-19");
+      expect(row.startTime).toBe("08:00:00");
+
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.move"));
+      expect(audits).toHaveLength(1);
+      expect(audits[0].payload).toMatchObject({
+        before: { date: "2026-05-18" },
+        after: { date: "2026-05-19" },
+      });
+    });
+  });
+
+  it("conflict at destination returns conflict AND leaves the original shift untouched", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const clsA = await makeClass(tx);
+      const clsB = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: clsA.id });
+      currentAdminId.value = admin.id;
+
+      // Block destination: same employee, same date, different class.
+      await createShiftAction({
+        classId: clsB.id, employeeId: emp.id, date: "2026-05-19",
+        startTime: "08:00", endTime: "12:00",
+      });
+
+      // Source shift in class A on 2026-05-18.
+      const src = await createShiftAction({
+        classId: clsA.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!src.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: src.data.id,
+        date: "2026-05-19",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe("conflict");
+        expect(result.error.conflicts[0].rule).toBe("a");
+      }
+
+      // Original row is untouched.
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, src.data.id));
+      expect(row.date).toBe("2026-05-18");
+      expect(row.startTime).toBe("08:00:00");
+
+      // No shift.move audit row was written.
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.move"));
+      expect(audits).toHaveLength(0);
+    });
+  });
+
+  it("same-date no-op move (date + times identical) writes audit with identical before/after", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-18",
+        startTime: "08:00",
+        endTime: "12:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(row.date).toBe("2026-05-18");
+    });
+  });
+
+  it("self-exclusion: moving a row 'onto itself' (same date) is conflict-free even though the row exists at that date", async () => {
+    // Regression guard for the excludeShiftId pass-through. Without it, moveShiftAction
+    // to the row's current location would self-conflict.
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await moveShiftAction({
+        shiftId: create.data.id,
+        date: "2026-05-18",
+        startTime: "09:00",
+        endTime: "13:00",
+      });
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it("preserves source_template_id and exclude-template-from-rule-c for moved replacement overrides", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      const t = await makeTemplate(tx, {
+        classId: cls.id, employeeId: emp.id, dayOfWeek: 0,
+        startTime: "08:00", endTime: "12:00", effectiveFrom: "2026-05-11",
+      });
+      currentAdminId.value = admin.id;
+      const src = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18",
+        startTime: "09:00", endTime: "11:00",
+        sourceTemplateId: t.id,
+      });
+      if (!src.ok) throw new Error("setup");
+
+      // Move to Tuesday (no template instance on Tuesday for this employee).
+      const result = await moveShiftAction({
+        shiftId: src.data.id,
+        date: "2026-05-19",
+        startTime: "09:00",
+        endTime: "11:00",
+      });
+
+      expect(result.ok).toBe(true);
+      const [row] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, src.data.id));
+      // source_template_id stays bound to T1; the resolver's suppression key
+      // (T1, emp, date) now refers to Tuesday — which has no template instance,
+      // so nothing visible is suppressed. Acceptable v1 behavior.
+      expect(row.sourceTemplateId).toBe(t.id);
+    });
+  });
+});
+```
+
+- [ ] **Step 3: Run; confirm fail**
+
+Run: `pnpm test:run src/app/\(admin\)/admin/classes/__tests__/actions.test.ts`
+Expected: 5 new tests fail (module export missing).
+
+- [ ] **Step 4: Implement `moveShiftAction`**
+
+Append to actions.ts:
+
+```ts
+import { moveShiftInputSchema } from "@/lib/schedule/schemas";
+
+export async function moveShiftAction(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = moveShiftInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+
+  return runActionTx("shift.move", { shiftId: data.shiftId, date: data.date }, async (tx) => {
+    const [existing] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, data.shiftId));
+    if (!existing) return { ok: false, error: { code: "not_found", message: "Shift not found" } };
+
+    const ctx = await loadClassesEmployeesTemplatesForShift(tx, {
+      classId: existing.classId,
+      employeeId: existing.employeeId,
+      date: data.date,
+    });
+
+    const conflicts = detectShiftConflicts(
+      {
+        kind: "shift",
+        classId: existing.classId,
+        employeeId: existing.employeeId,
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+      },
+      {
+        crossClassShifts: ctx.crossClassShifts,
+        crossClassTemplates: [],
+        sameClassTemplates: ctx.sameClassTemplates,
+        excludeShiftId: data.shiftId,
+        excludeTemplateId: existing.sourceTemplateId ?? undefined,
+      },
+    );
+    if (conflicts.length > 0) {
+      return { ok: false, error: { code: "conflict", message: "Move target has conflicts", conflicts } };
+    }
+
+    await tx
+      .update(scheduleShifts)
+      .set({
+        date: data.date,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        updatedAt: new Date(),
+      })
+      .where(eq(scheduleShifts.id, data.shiftId));
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "shift.move",
+      targetId: data.shiftId,
+      payload: {
+        before: { date: existing.date, startTime: existing.startTime, endTime: existing.endTime },
+        after: { date: data.date, startTime: data.startTime, endTime: data.endTime },
+      },
+    });
+
+    revalidatePath(`/admin/classes/${existing.classId}/schedule`);
+    return { ok: true, data: { id: data.shiftId } };
+  });
+}
+```
+
+- [ ] **Step 5: Run; confirm PASS** (21 actions tests total now)
+
+- [ ] **Step 6: Commit the action**
+
+```bash
+git add src/lib/schedule/schemas.ts src/lib/schedule/__tests__/schemas.test.ts \
+        src/app/\(admin\)/admin/classes/\[id\]/actions.ts \
+        src/app/\(admin\)/admin/classes/__tests__/actions.test.ts
+git commit -m "feat(classes): moveShiftAction with atomic UPDATE + pre-mutation conflict check"
+```
+
+- [ ] **Step 7: Wire drag handlers in WeekGrid + ShiftBlock**
 
 Replace `ShiftBlock.tsx`:
 
@@ -2895,59 +3261,164 @@ export function ShiftBlock({
 }
 ```
 
-Only `override` shifts are draggable (template-derived requires opening the dialog and creating a replacement override). This matches §5.5.
-
-- [ ] **Step 2: Add drop handlers + the action call to WeekGrid**
-
-Modify `WeekGrid.tsx` to handle `onDragOver` + `onDrop` on each cell. On drop, compute the duration of the dragged shift, the new `startTime` (same time-of-day; only the date changes), and call `updateShiftAction({ shiftId, ...})`. But `updateShiftAction` doesn't allow changing `date` — per Plan 3 Task 7, `classId` and `date` are immutable. Therefore drag-to-move must be a **delete + create** under the hood, not an update.
-
-Inside `WeekGrid`, when a drop is finalized:
-1. Call `deleteShiftAction({ shiftId: dragged.shift_id })`.
-2. If that succeeded, call `createShiftAction({ classId, employeeId, date: newDate, startTime, endTime, sourceTemplateId: dragged.source_template_id ?? undefined })`.
-3. If create fails (e.g., conflict), surface the conflict modal AND undo by re-creating the original. To keep v1 simple, just surface the error and let the admin redo manually — the original is gone.
-
-Trade-off: a conflict on the new location loses the original. Alternative: skip the delete and just show "can't move there" — but that requires a no-conflict pre-check. For v1, accept the simpler delete-then-create + clear error message.
-
-**Deviation from spec §5.5:** the spec describes drag as a UX wrapper around `updateShiftAction` preserving duration and computing new `startTime`/`endTime` (within-day time shift). That model fits a Google-Calendar-style timeline grid, which Plan 3 doesn't build — the WeekGrid is a text-based date × employee table with no time axis. The natural drag affordance in a text grid is across-day (move from Monday's cell to Tuesday's cell), keeping start/end times unchanged. Since `updateShiftAction` doesn't allow `date` changes (Task 7's immutability), the implementation is **delete-then-create**.
-
-Drop handler (use `useRef` for drag state):
+In `WeekGrid.tsx`, accept an `onMove` callback and add drag/drop handlers to each cell:
 
 ```tsx
-async function onCellDrop(targetDate: string) {
-  const data = dragRef.current;
-  if (!data) return;
-  // Drag preserves the time-of-day; only the date changes. No duration math needed.
-  const del = await deleteShiftAction({ shiftId: data.shiftId });
-  if (!del.ok) { setError(del.error.message); return; }
-  const create = await createShiftAction({
-    classId: data.classId,
-    employeeId: data.employeeId,
-    date: targetDate,
-    startTime: data.startTime,
-    endTime: data.endTime,
-    sourceTemplateId: data.sourceTemplateId ?? undefined,
-  });
-  if (!create.ok) {
-    if (create.error.code === "conflict") onConflict(create.error.conflicts);
-    else setError(create.error.message);
-    // The original was deleted; the admin will need to recreate it manually.
-    // Acceptable v1 trade-off; see §5.5 deviation note above.
-    return;
-  }
-  router.refresh();
+"use client";
+
+import { useRef } from "react";
+import type { ResolvedShift, ScheduleMode } from "@/lib/schedule/types";
+import type { ConflictReason } from "@/lib/actions/errors";
+import { addDaysISO } from "@/lib/dates";
+import type { DialogTarget } from "./ScheduleClient";
+import { ShiftBlock } from "./ShiftBlock";
+
+const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+
+type DragData = {
+  shiftId: string;
+  sourceDate: string;
+  sourceEmployeeId: string;
+  startTime: string;
+  endTime: string;
+};
+
+export function WeekGrid({
+  weekStartISO,
+  mode,
+  shifts,
+  onBlockClick,
+  onMove,
+}: {
+  weekStartISO: string;
+  mode: ScheduleMode;
+  shifts: ResolvedShift[];
+  onBlockClick: (target: DialogTarget) => void;
+  onMove: (data: DragData, targetDate: string) => Promise<void>;
+}) {
+  const dragRef = useRef<DragData | null>(null);
+  // ... (employees and dates as before)
+  const employees = Array.from(new Map(shifts.map((s) => [s.employee_id, s.employee])).values())
+    .sort((a, b) => a.last_name.localeCompare(b.last_name));
+  const dates = Array.from({ length: 5 }, (_, i) => addDaysISO(weekStartISO, i));
+
+  const onDragStartShift = (_e: React.DragEvent, s: ResolvedShift) => {
+    if (s.source !== "override") return;
+    dragRef.current = {
+      shiftId: s.shift_id,
+      sourceDate: s.date,
+      sourceEmployeeId: s.employee_id,
+      startTime: s.start_time,
+      endTime: s.end_time,
+    };
+  };
+
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full text-sm">
+        {/* ... header ... */}
+        <tbody>
+          {employees.map((emp) => (
+            <tr key={emp.id} className="border-t">
+              <td className="px-3 py-2 align-top">{emp.first_name} {emp.last_name}</td>
+              {dates.map((d, i) => {
+                const cellShifts = shifts.filter((s) => s.employee_id === emp.id && s.date === d);
+                return (
+                  <td
+                    key={d}
+                    className="px-3 py-2 align-top cursor-pointer hover:bg-muted/40"
+                    onDragOver={(e) => { if (dragRef.current && dragRef.current.sourceEmployeeId === emp.id) e.preventDefault(); }}
+                    onDrop={async (e) => {
+                      e.preventDefault();
+                      const data = dragRef.current;
+                      dragRef.current = null;
+                      if (!data) return;
+                      if (data.sourceEmployeeId !== emp.id) return; // disallow employee changes via drag (v1)
+                      if (data.sourceDate === d) return; // same-cell no-op
+                      await onMove(data, d);
+                    }}
+                    onClick={() => {
+                      if (cellShifts.length === 0) {
+                        onBlockClick(
+                          mode === "template"
+                            ? { kind: "new-template", dayOfWeek: i, employeeId: emp.id }
+                            : { kind: "new-shift", date: d, employeeId: emp.id },
+                        );
+                      }
+                    }}
+                  >
+                    {cellShifts.length === 0 ? (
+                      <span className="text-xs text-muted-foreground">+ add</span>
+                    ) : (
+                      cellShifts.map((s) => (
+                        <ShiftBlock
+                          key={s.source === "template" ? `t:${s.template_id}:${d}` : `o:${s.shift_id}`}
+                          shift={s}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onBlockClick(
+                              s.source === "template"
+                                ? { kind: "edit-template", shift: s }
+                                : { kind: "edit-shift", shift: s },
+                            );
+                          }}
+                          onDragStart={onDragStartShift}
+                        />
+                      ))
+                    )}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 ```
 
-- [ ] **Step 3: Manual smoke**
+In `ScheduleClient.tsx`, wire `onMove` to call `moveShiftAction` and surface conflicts:
 
-Drag an override shift from one weekday to another. Verify it lands in the new cell. Drag onto a cell where the same employee has an existing shift → expect the conflict modal.
+```tsx
+import { moveShiftAction } from "@/app/(admin)/admin/classes/[id]/actions";
 
-- [ ] **Step 4: Commit**
+const onMove = async (data: DragData, targetDate: string) => {
+  const result = await moveShiftAction({
+    shiftId: data.shiftId,
+    date: targetDate,
+    startTime: data.startTime,
+    endTime: data.endTime,
+  });
+  if (result.ok) {
+    router.refresh();
+    return;
+  }
+  if (result.error.code === "conflict") {
+    setConflicts(result.error.conflicts);
+  } else {
+    // Toast / inline error — not in scope to add a toast system in Plan 3.
+    // Fall through and refresh; the failure means the row didn't move.
+    console.error("[moveShiftAction]", result.error);
+  }
+};
+
+// pass onMove to <WeekGrid ... onMove={onMove} />
+```
+
+Also export `DragData` from `WeekGrid.tsx` so `ScheduleClient.tsx` imports the type.
+
+- [ ] **Step 8: Manual smoke**
+
+Drag an override shift from one weekday to another for the same employee. Verify it lands. Drag onto a cell where the same employee has a same-time shift in another class (set this up first) → expect the conflict modal and the source cell unchanged.
+
+- [ ] **Step 9: Commit the UI wiring**
 
 ```bash
 git add src/app/\(admin\)/admin/classes/\[id\]/schedule/_components/ShiftBlock.tsx \
-        src/app/\(admin\)/admin/classes/\[id\]/schedule/_components/WeekGrid.tsx
-git commit -m "feat(classes/schedule): drag-to-move (override only, delete+create under the hood)"
+        src/app/\(admin\)/admin/classes/\[id\]/schedule/_components/WeekGrid.tsx \
+        src/app/\(admin\)/admin/classes/\[id\]/schedule/_components/ScheduleClient.tsx
+git commit -m "feat(classes/schedule): wire drag-to-move via moveShiftAction (atomic, non-destructive)"
 ```
 
 ---
@@ -2977,7 +3448,7 @@ git commit -m "feat(classes): link list rows to per-class schedule pages"
 - [ ] **Step 1: Full automated suite**
 
 Run: `pnpm typecheck && pnpm lint && pnpm test:run`
-Expected: all three exit 0. Plan 2's 111 tests + Plan 3's additions (~33 new: conflicts 10, resolver 10, schemas 13, actions 16) ≈ 160 tests.
+Expected: all three exit 0. Plan 2's 111 tests + Plan 3's additions (~59 new: conflicts 12, resolver 10, schemas 16, actions 21) ≈ 170 tests.
 
 - [ ] **Step 2: Build**
 
