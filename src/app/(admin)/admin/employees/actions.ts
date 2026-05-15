@@ -5,13 +5,18 @@ import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { runActionTx } from "@/lib/actions/transactions";
 import type { ActionResult } from "@/lib/actions/errors";
-import { employeeInputSchema } from "@/lib/employees/schemas";
+import {
+  employeeInputSchema,
+  type EmployeeImportRow,
+} from "@/lib/employees/schemas";
 import {
   computePersonalEntitlement,
   computeVacationEntitlement,
 } from "@/lib/balances/entitlements";
 import { writeAuditLog } from "@/lib/audit/write";
 import { todayET } from "@/lib/dates";
+import { validateEmployeeImportSheet } from "@/lib/sheets/employee-import";
+import type { ParsedRow } from "@/lib/sheets/parse";
 import { balanceTransactions, classes, employees } from "@/db/schema";
 
 export async function createEmployeeAction(
@@ -127,4 +132,41 @@ export async function createEmployeeAction(
     revalidatePath("/admin/employees");
     return { ok: true, data: { id: emp.id } };
   });
+}
+
+const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+export async function parseEmployeeImportAction(
+  formData: FormData,
+): Promise<
+  ActionResult<{ sessionId: string; rows: ParsedRow<EmployeeImportRow>[] }>
+> {
+  // No DB writes — admin auth is the only side-effect. Therefore no
+  // runActionTx wrapper (Guardrail C).
+  await requireAdmin();
+
+  const file = formData.get("file");
+  if (!(file instanceof Blob) || file.size === 0) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "No file attached" },
+    };
+  }
+  if (file.size > MAX_IMPORT_FILE_BYTES) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "File too large (>5MB)" },
+    };
+  }
+
+  const buf = Buffer.from(await file.arrayBuffer());
+  const result = validateEmployeeImportSheet(buf);
+
+  return {
+    ok: true,
+    data: {
+      sessionId: crypto.randomUUID(),
+      rows: result.rows,
+    },
+  };
 }

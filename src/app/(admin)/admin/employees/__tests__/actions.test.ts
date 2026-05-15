@@ -23,7 +23,32 @@ vi.mock("@/lib/auth", () => ({
   requireAdmin: async () => ({ id: currentAdminId.value }),
 }));
 
-import { createEmployeeAction } from "@/app/(admin)/admin/employees/actions";
+import {
+  createEmployeeAction,
+  parseEmployeeImportAction,
+} from "@/app/(admin)/admin/employees/actions";
+import { utils, write as xlsxWrite } from "xlsx";
+
+function makeFormData(rows: Array<Record<string, unknown>>): FormData {
+  const ws = utils.json_to_sheet(rows);
+  const wb = utils.book_new();
+  utils.book_append_sheet(wb, ws, "Sheet1");
+  const buf = xlsxWrite(wb, { type: "buffer", bookType: "xlsx" }) as Buffer;
+  // Copy into a fresh ArrayBuffer so the Blob constructor's BlobPart type
+  // is satisfied (Node's Buffer carries an ArrayBufferLike which TS treats
+  // as possibly SharedArrayBuffer; Blob only accepts plain ArrayBuffer).
+  const ab = new ArrayBuffer(buf.byteLength);
+  new Uint8Array(ab).set(buf);
+  const fd = new FormData();
+  fd.append(
+    "file",
+    new Blob([ab], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }),
+    "employees.xlsx",
+  );
+  return fd;
+}
 
 describe("createEmployeeAction", () => {
   it("inserts an employee with vacation+personal balance writes when entitled", async () => {
@@ -183,6 +208,69 @@ describe("createEmployeeAction", () => {
           expect(collision.error.fieldErrors?.email).toBeDefined();
         }
       }
+    });
+  });
+});
+
+describe("parseEmployeeImportAction", () => {
+  it("returns parsed rows + a sessionId for a valid sheet", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const fd = makeFormData([
+        {
+          first_name: "Maria",
+          last_name: "L.",
+          email: "maria@example.com",
+          role_in_class: "teacher",
+          default_class_name: "Pre-K",
+          anniversary_date: "2025-01-15",
+          scheduled_hours_per_week: 40,
+        },
+      ]);
+
+      const result = await parseEmployeeImportAction(fd);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.data.sessionId).toBeTruthy();
+      expect(result.data.rows).toHaveLength(1);
+      expect(result.data.rows[0].ok).toBe(true);
+    });
+  });
+
+  it("returns rows with per-row errors for invalid input", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const fd = makeFormData([
+        {
+          first_name: "Bad",
+          last_name: "Role",
+          email: "bad@example.com",
+          role_in_class: "manager",
+          default_class_name: "Pre-K",
+          anniversary_date: "2025-01-15",
+          scheduled_hours_per_week: 40,
+        },
+      ]);
+
+      const result = await parseEmployeeImportAction(fd);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.data.rows[0].ok).toBe(false);
+    });
+  });
+
+  it("returns validation error when no file is attached", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+
+      const result = await parseEmployeeImportAction(new FormData());
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("validation");
     });
   });
 });
