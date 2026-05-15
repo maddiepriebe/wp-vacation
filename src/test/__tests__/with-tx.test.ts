@@ -36,7 +36,7 @@ describe("withTx", () => {
   it("binds ALS so runActionTx joins as savepoint and rolls back with the test", async () => {
     let actionInsertedId: string | undefined;
 
-    await withTx(async (_tx) => {
+    await withTx(async () => {
       const result = await runActionTx<{ id: string }>(
         "test.via-withTx",
         {},

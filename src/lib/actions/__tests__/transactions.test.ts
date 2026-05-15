@@ -4,7 +4,6 @@ import { db } from "@/db/client";
 import { classes } from "@/db/schema";
 import { IntentionalRollback, txStorage } from "@/lib/actions/transactions";
 import { runActionTx } from "@/lib/actions/transactions";
-import type { ActionResult } from "@/lib/actions/errors";
 
 async function rollbackAfter<T>(test: () => Promise<T>): Promise<T> {
   try {
