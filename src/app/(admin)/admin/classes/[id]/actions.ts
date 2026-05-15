@@ -15,6 +15,7 @@ import {
 import { detectShiftConflicts } from "@/lib/schedule/conflicts";
 import {
   createShiftInputSchema,
+  deleteShiftInputSchema,
   updateShiftInputSchema,
 } from "@/lib/schedule/schemas";
 import type { TemplateLike, ShiftLike } from "@/lib/schedule/types";
@@ -213,5 +214,41 @@ export async function updateShiftAction(input: unknown): Promise<ActionResult<{ 
 
     revalidatePath(`/admin/classes/${existing.classId}/schedule`);
     return { ok: true, data: { id: data.shiftId } };
+  });
+}
+
+export async function deleteShiftAction(input: unknown): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = deleteShiftInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "validation", message: "Invalid input" } };
+  }
+  const { shiftId } = parsed.data;
+
+  return runActionTx("shift.delete", { shiftId }, async (tx) => {
+    const [existing] = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, shiftId));
+    if (!existing) return { ok: false, error: { code: "not_found", message: "Shift not found" } };
+
+    await tx.delete(scheduleShifts).where(eq(scheduleShifts.id, shiftId));
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "shift.delete",
+      targetId: shiftId,
+      payload: {
+        deleted: {
+          shiftId,
+          classId: existing.classId,
+          employeeId: existing.employeeId,
+          date: existing.date,
+          startTime: existing.startTime,
+          endTime: existing.endTime,
+          sourceTemplateId: existing.sourceTemplateId,
+        },
+      },
+    });
+
+    revalidatePath(`/admin/classes/${existing.classId}/schedule`);
+    return { ok: true, data: { id: shiftId } };
   });
 }

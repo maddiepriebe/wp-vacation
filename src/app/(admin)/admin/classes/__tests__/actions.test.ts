@@ -13,6 +13,7 @@ vi.mock("@/lib/auth", () => ({
 
 import {
   createShiftAction,
+  deleteShiftAction,
   updateShiftAction,
 } from "@/app/(admin)/admin/classes/[id]/actions";
 
@@ -230,6 +231,48 @@ describe("updateShiftAction", () => {
       const result = await updateShiftAction({ shiftId: create.data.id, employeeId: e2.id });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error.code).toBe("conflict");
+    });
+  });
+});
+
+describe("deleteShiftAction", () => {
+  it("deletes the row and writes shift.delete audit with reconstructable payload", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      const emp = await makeEmployee(tx, { defaultClassId: cls.id });
+      currentAdminId.value = admin.id;
+      const create = await createShiftAction({
+        classId: cls.id, employeeId: emp.id, date: "2026-05-18", startTime: "08:00", endTime: "12:00",
+      });
+      if (!create.ok) throw new Error("setup");
+
+      const result = await deleteShiftAction({ shiftId: create.data.id });
+      expect(result.ok).toBe(true);
+
+      const rows = await tx.select().from(scheduleShifts).where(eq(scheduleShifts.id, create.data.id));
+      expect(rows).toHaveLength(0);
+
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "shift.delete"));
+      expect(audits).toHaveLength(1);
+      expect(audits[0].payload).toMatchObject({
+        deleted: {
+          shiftId: create.data.id,
+          classId: cls.id,
+          employeeId: emp.id,
+          date: "2026-05-18",
+        },
+      });
+    });
+  });
+
+  it("returns not_found for missing shift", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+      const result = await deleteShiftAction({ shiftId: "00000000-0000-0000-0000-000000000000" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("not_found");
     });
   });
 });
