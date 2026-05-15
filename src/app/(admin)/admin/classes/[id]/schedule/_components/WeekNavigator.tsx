@@ -9,19 +9,26 @@ export function WeekNavigator({
   weekStartISO: string;
   onChange: (iso: string) => void;
 }) {
+  const fmt = (iso: string) => {
+    const [y, m, d] = iso.split("-");
+    return `${m}/${d}/${y.slice(2)}`;
+  };
+  const endISO = addDaysISO(weekStartISO, 4);
   return (
-    <div className="flex gap-1">
+    <div className="inline-flex items-center gap-1 rounded-md border bg-card px-1 py-0.5">
       <button
         type="button"
-        className="rounded border px-2 py-1 text-xs"
+        className="rounded px-2 py-1 text-xs"
         onClick={() => onChange(addDaysISO(weekStartISO, -7))}
       >
         ‹
       </button>
-      <span className="text-xs">{weekStartISO}</span>
+      <span className="px-2 text-xs">
+        {fmt(weekStartISO)} – {fmt(endISO)}
+      </span>
       <button
         type="button"
-        className="rounded border px-2 py-1 text-xs"
+        className="rounded px-2 py-1 text-xs"
         onClick={() => onChange(addDaysISO(weekStartISO, 7))}
       >
         ›
