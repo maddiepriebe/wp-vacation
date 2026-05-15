@@ -14,7 +14,12 @@ import { ConflictModal } from "./ConflictModal";
 export type DialogTarget =
   | { kind: "new-shift"; date: string; employeeId: string | null }
   | { kind: "edit-shift"; shift: Extract<ResolvedShift, { source: "override" }> }
-  | { kind: "new-template"; dayOfWeek: number; employeeId: string | null }
+  | {
+      kind: "new-template";
+      dayOfWeek: number;
+      employeeId: string | null;
+      effectiveFromISO?: string;
+    }
   | {
       kind: "edit-template";
       shift: Extract<ResolvedShift, { source: "template" }>;
@@ -62,13 +67,20 @@ export function ScheduleClient({
         weekStartISO={weekStartISO}
         mode={mode}
         shifts={initialShifts}
-        onBlockClick={(t) => setDialog(t)}
+        onBlockClick={(t) =>
+          setDialog(
+            t.kind === "new-template"
+              ? { ...t, effectiveFromISO: weekStartISO }
+              : t,
+          )
+        }
       />
 
       {dialog && (
         <ShiftEditDialog
           classId={classId}
           mode={mode}
+          weekStartISO={weekStartISO}
           target={dialog}
           onClose={() => setDialog(null)}
           onConflict={(c) => {
