@@ -5,7 +5,8 @@ import { useRouter } from "next/navigation";
 import type { Route } from "next";
 import type { ResolvedShift, ScheduleMode } from "@/lib/schedule/types";
 import type { ConflictReason } from "@/lib/actions/errors";
-import { WeekGrid } from "./WeekGrid";
+import { moveShiftAction } from "@/app/(admin)/admin/classes/[id]/actions";
+import { WeekGrid, type DragData } from "./WeekGrid";
 import { WeekNavigator } from "./WeekNavigator";
 import { ModeToggle } from "./ModeToggle";
 import { ShiftEditDialog } from "./ShiftEditDialog";
@@ -53,6 +54,26 @@ export function ScheduleClient({
     );
   };
 
+  const onMove = async (data: DragData, targetDate: string) => {
+    const result = await moveShiftAction({
+      shiftId: data.shiftId,
+      date: targetDate,
+      startTime: data.startTime,
+      endTime: data.endTime,
+    });
+    if (result.ok) {
+      router.refresh();
+      return;
+    }
+    if (result.error.code === "conflict") {
+      setConflicts(result.error.conflicts);
+    } else {
+      // No toast system yet; log so the failure is visible. The grid is server-rendered
+      // and never moved optimistically, so there is nothing to revert.
+      console.error("[moveShiftAction]", result.error);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <header className="flex items-center justify-between">
@@ -74,6 +95,7 @@ export function ScheduleClient({
               : t,
           )
         }
+        onMove={onMove}
       />
 
       {dialog && (
