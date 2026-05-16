@@ -9,6 +9,7 @@ export default defineConfig({
     environment: "node",
     globals: false,
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    exclude: ["tests/e2e/**", "node_modules/**", "dist/**", ".next/**"],
     globalSetup: ["./src/test/load-env.ts", "./src/test/check-schema.ts"],
   },
   resolve: {
