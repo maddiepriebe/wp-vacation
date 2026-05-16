@@ -1,6 +1,6 @@
 "use server";
 
-import { and, eq, gte, lte, ne } from "drizzle-orm";
+import { and, eq, gte, lte, ne, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { runActionTx } from "@/lib/actions/transactions";
@@ -9,6 +9,7 @@ import { writeAuditLog } from "@/lib/audit/write";
 import {
   classes,
   employees,
+  enrollmentForecasts,
   scheduleShiftTemplates,
   scheduleShifts,
 } from "@/db/schema";
@@ -20,12 +21,14 @@ import {
   copyWeekInputSchema,
   createShiftInputSchema,
   createShiftTemplateInputSchema,
+  deleteEnrollmentForecastInputSchema,
   deleteShiftInputSchema,
   deleteShiftTemplateInputSchema,
   moveShiftInputSchema,
   saveAsTemplateInputSchema,
   updateShiftInputSchema,
   updateShiftTemplateInputSchema,
+  upsertEnrollmentForecastInputSchema,
 } from "@/lib/schedule/schemas";
 import type { TemplateLike, ShiftLike } from "@/lib/schedule/types";
 
@@ -790,4 +793,81 @@ export async function copyWeekAction(input: unknown): Promise<ActionResult<{ cla
       return { ok: true, data: { classId: data.classId, copiedOverrideCount: sourceOverrides.length } };
     },
   );
+}
+
+export async function upsertEnrollmentForecastAction(
+  input: unknown,
+): Promise<ActionResult<{ id: string }>> {
+  const admin = await requireAdmin();
+  const parsed = upsertEnrollmentForecastInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+
+  return runActionTx("enrollment.upsert", { classId: data.classId, date: data.date }, async (tx) => {
+    const [cls] = await tx.select({ id: classes.id }).from(classes).where(eq(classes.id, data.classId));
+    if (!cls) return { ok: false, error: { code: "class_missing", message: "Class not found" } };
+
+    const [row] = await tx
+      .insert(enrollmentForecasts)
+      .values({ classId: data.classId, date: data.date, expectedStudents: data.expectedStudents })
+      .onConflictDoUpdate({
+        target: [enrollmentForecasts.classId, enrollmentForecasts.date],
+        set: { expectedStudents: data.expectedStudents, updatedAt: sql`now()` },
+      })
+      .returning({ id: enrollmentForecasts.id });
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "enrollment.upsert",
+      targetId: row.id,
+      payload: { classId: data.classId, date: data.date, expectedStudents: data.expectedStudents },
+    });
+
+    revalidatePath(`/admin/classes/${data.classId}/schedule`);
+    return { ok: true, data: { id: row.id } };
+  });
+}
+
+export async function deleteEnrollmentForecastAction(
+  input: unknown,
+): Promise<ActionResult<{ classId: string }>> {
+  const admin = await requireAdmin();
+  const parsed = deleteEnrollmentForecastInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "validation", message: "Invalid input" } };
+  }
+  const data = parsed.data;
+
+  return runActionTx("enrollment.delete", { classId: data.classId, date: data.date }, async (tx) => {
+    const deleted = await tx
+      .delete(enrollmentForecasts)
+      .where(and(eq(enrollmentForecasts.classId, data.classId), eq(enrollmentForecasts.date, data.date)))
+      .returning();
+
+    // No-op semantics: succeed silently when nothing to delete. Skip audit if nothing changed.
+    if (deleted.length === 0) {
+      return { ok: true, data: { classId: data.classId } };
+    }
+
+    await writeAuditLog(tx, {
+      actorAdminId: admin.id,
+      action: "enrollment.delete",
+      targetId: data.classId,
+      payload: {
+        deleted: {
+          classId: deleted[0].classId,
+          date: deleted[0].date,
+          expectedStudents: deleted[0].expectedStudents,
+        },
+      },
+    });
+
+    revalidatePath(`/admin/classes/${data.classId}/schedule`);
+    return { ok: true, data: { classId: data.classId } };
+  });
 }

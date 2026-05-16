@@ -945,3 +945,85 @@ describe("copyWeekAction", () => {
     });
   });
 });
+
+import {
+  deleteEnrollmentForecastAction,
+  upsertEnrollmentForecastAction,
+} from "@/app/(admin)/admin/classes/[id]/actions";
+import { enrollmentForecasts } from "@/db/schema";
+
+describe("upsertEnrollmentForecastAction", () => {
+  it("inserts a new row and writes enrollment.upsert audit", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const result = await upsertEnrollmentForecastAction({
+        classId: cls.id, date: "2026-05-18", expectedStudents: 18,
+      });
+      expect(result.ok).toBe(true);
+      const rows = await tx.select().from(enrollmentForecasts).where(eq(enrollmentForecasts.classId, cls.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].expectedStudents).toBe(18);
+      const [audit] = await tx.select().from(auditLog).where(eq(auditLog.action, "enrollment.upsert"));
+      expect(audit.entityType).toBe("enrollment");
+    });
+  });
+
+  it("updates existing row on (classId, date) conflict", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      await upsertEnrollmentForecastAction({ classId: cls.id, date: "2026-05-18", expectedStudents: 18 });
+      const result = await upsertEnrollmentForecastAction({ classId: cls.id, date: "2026-05-18", expectedStudents: 20 });
+      expect(result.ok).toBe(true);
+      const rows = await tx.select().from(enrollmentForecasts).where(eq(enrollmentForecasts.classId, cls.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].expectedStudents).toBe(20);
+    });
+  });
+
+  it("returns class_missing for unknown classId", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      currentAdminId.value = admin.id;
+      const result = await upsertEnrollmentForecastAction({
+        classId: "00000000-0000-0000-0000-000000000000",
+        date: "2026-05-18",
+        expectedStudents: 18,
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("class_missing");
+    });
+  });
+});
+
+describe("deleteEnrollmentForecastAction", () => {
+  it("deletes an existing row and writes audit", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      await upsertEnrollmentForecastAction({ classId: cls.id, date: "2026-05-18", expectedStudents: 18 });
+      const result = await deleteEnrollmentForecastAction({ classId: cls.id, date: "2026-05-18" });
+      expect(result.ok).toBe(true);
+      const rows = await tx.select().from(enrollmentForecasts).where(eq(enrollmentForecasts.classId, cls.id));
+      expect(rows).toHaveLength(0);
+      const [audit] = await tx.select().from(auditLog).where(eq(auditLog.action, "enrollment.delete"));
+      expect(audit.payload).toMatchObject({ deleted: { classId: cls.id, date: "2026-05-18", expectedStudents: 18 } });
+    });
+  });
+
+  it("is a no-op (ok: true) when the row doesn't exist", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const result = await deleteEnrollmentForecastAction({ classId: cls.id, date: "2026-05-18" });
+      expect(result.ok).toBe(true);
+      const audits = await tx.select().from(auditLog).where(eq(auditLog.action, "enrollment.delete"));
+      expect(audits).toHaveLength(0); // no audit when nothing was deleted
+    });
+  });
+});
