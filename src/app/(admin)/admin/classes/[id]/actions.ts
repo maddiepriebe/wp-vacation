@@ -4,7 +4,7 @@ import { and, eq, gte, lte, ne, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
-import { runActionTx } from "@/lib/actions/transactions";
+import { dbOrTx, runActionTx } from "@/lib/actions/transactions";
 import type { ActionResult, ConflictReason } from "@/lib/actions/errors";
 import { writeAuditLog } from "@/lib/audit/write";
 import {
@@ -929,4 +929,23 @@ export async function commitEnrollmentImportAction(
       return { ok: true, data: { classId: data.classId, count: data.rows.length } };
     },
   );
+}
+
+export async function countTargetWeekShiftsAction(input: {
+  classId: string;
+  targetWeekStartISO: string;
+}): Promise<ActionResult<{ count: number }>> {
+  await requireAdmin();
+  // Light read — no transaction needed.
+  const rows = await dbOrTx()
+    .select({ id: scheduleShifts.id })
+    .from(scheduleShifts)
+    .where(
+      and(
+        eq(scheduleShifts.classId, input.classId),
+        gte(scheduleShifts.date, input.targetWeekStartISO),
+        lte(scheduleShifts.date, weekEnd(input.targetWeekStartISO)),
+      ),
+    );
+  return { ok: true, data: { count: rows.length } };
 }

@@ -13,6 +13,7 @@ import { ModeToggle } from "./ModeToggle";
 import { ShiftEditDialog } from "./ShiftEditDialog";
 import { ConflictModal } from "./ConflictModal";
 import { SaveAsTemplateDialog } from "./SaveAsTemplateDialog";
+import { CopyWeekDialog } from "./CopyWeekDialog";
 
 export type DialogTarget =
   | { kind: "new-shift"; date: string; employeeId: string | null }
@@ -47,6 +48,7 @@ export function ScheduleClient({
   const [dialog, setDialog] = useState<DialogTarget | null>(null);
   const [conflicts, setConflicts] = useState<ConflictReason[] | null>(null);
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  const [copyDialogOpen, setCopyDialogOpen] = useState(false);
 
   const switchMode = (next: ScheduleMode) => {
     router.push(
@@ -91,6 +93,15 @@ export function ScheduleClient({
               className="rounded-md border bg-card px-3 py-1 text-xs"
             >
               Save as template
+            </button>
+          )}
+          {mode === "week" && (
+            <button
+              type="button"
+              onClick={() => setCopyDialogOpen(true)}
+              className="rounded-md border bg-card px-3 py-1 text-xs"
+            >
+              Copy week
             </button>
           )}
           {mode === "week" && (
@@ -146,6 +157,15 @@ export function ScheduleClient({
             setSaveDialogOpen(false);
             setConflicts(c);
           }}
+        />
+      )}
+
+      {copyDialogOpen && (
+        <CopyWeekDialog
+          classId={classId}
+          sourceWeekStartISO={weekStartISO}
+          visibleShiftCount={initialShifts.length}
+          onClose={() => setCopyDialogOpen(false)}
         />
       )}
 
