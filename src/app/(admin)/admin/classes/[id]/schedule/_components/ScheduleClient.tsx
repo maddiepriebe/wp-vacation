@@ -112,6 +112,18 @@ export function ScheduleClient({
               Upload enrollment
             </Link>
           )}
+          {mode === "week" && (
+            <Link
+              href={
+                `/admin/classes/${classId}/schedule/print?week=${weekStartISO}` as Route
+              }
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded-md border bg-card px-3 py-1 text-xs"
+            >
+              Print
+            </Link>
+          )}
           <ModeToggle mode={mode} onChange={switchMode} />
           <WeekNavigator weekStartISO={weekStartISO} onChange={switchWeek} />
         </div>
