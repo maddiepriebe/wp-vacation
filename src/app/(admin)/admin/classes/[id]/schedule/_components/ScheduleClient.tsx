@@ -12,6 +12,7 @@ import { WeekNavigator } from "./WeekNavigator";
 import { ModeToggle } from "./ModeToggle";
 import { ShiftEditDialog } from "./ShiftEditDialog";
 import { ConflictModal } from "./ConflictModal";
+import { SaveAsTemplateDialog } from "./SaveAsTemplateDialog";
 
 export type DialogTarget =
   | { kind: "new-shift"; date: string; employeeId: string | null }
@@ -45,6 +46,7 @@ export function ScheduleClient({
   const router = useRouter();
   const [dialog, setDialog] = useState<DialogTarget | null>(null);
   const [conflicts, setConflicts] = useState<ConflictReason[] | null>(null);
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
 
   const switchMode = (next: ScheduleMode) => {
     router.push(
@@ -83,6 +85,15 @@ export function ScheduleClient({
         <h1 className="text-2xl font-semibold tracking-tight">{className}</h1>
         <div className="flex items-center gap-2">
           {mode === "week" && (
+            <button
+              type="button"
+              onClick={() => setSaveDialogOpen(true)}
+              className="rounded-md border bg-card px-3 py-1 text-xs"
+            >
+              Save as template
+            </button>
+          )}
+          {mode === "week" && (
             <Link
               href={`/admin/classes/${classId}/enrollment/upload` as Route}
               className="rounded-md border bg-card px-3 py-1 text-xs"
@@ -120,6 +131,19 @@ export function ScheduleClient({
           onClose={() => setDialog(null)}
           onConflict={(c) => {
             setDialog(null);
+            setConflicts(c);
+          }}
+        />
+      )}
+
+      {saveDialogOpen && (
+        <SaveAsTemplateDialog
+          classId={classId}
+          weekStartISO={weekStartISO}
+          shifts={initialShifts}
+          onClose={() => setSaveDialogOpen(false)}
+          onConflict={(c) => {
+            setSaveDialogOpen(false);
             setConflicts(c);
           }}
         />
