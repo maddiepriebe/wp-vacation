@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
 import type { ResolvedShift, ScheduleMode } from "@/lib/schedule/types";
@@ -81,6 +82,14 @@ export function ScheduleClient({
       <header className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">{className}</h1>
         <div className="flex items-center gap-2">
+          {mode === "week" && (
+            <Link
+              href={`/admin/classes/${classId}/enrollment/upload` as Route}
+              className="rounded-md border bg-card px-3 py-1 text-xs"
+            >
+              Upload enrollment
+            </Link>
+          )}
           <ModeToggle mode={mode} onChange={switchMode} />
           <WeekNavigator weekStartISO={weekStartISO} onChange={switchWeek} />
         </div>
