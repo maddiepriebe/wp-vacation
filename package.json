@@ -60,6 +60,7 @@
     ]
   },
   "devDependencies": {
+    "@clerk/testing": "^2.0.29",
     "@eslint/eslintrc": "^3.3.5",
     "@playwright/test": "^1.60.0",
     "@tailwindcss/postcss": "^4.0.0",

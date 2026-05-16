@@ -6,25 +6,25 @@
  * 1. Dev server: `pnpm dev` on http://localhost:3000 (the playwright.config.ts
  *    `webServer` block boots one automatically and `reuseExistingServer: true`).
  *
- * 2. Scratch database: this spec writes real rows (employees, shift templates,
- *    shifts). Point `DATABASE_URL` at a throwaway Postgres — DO NOT run against
- *    production. Cleanup is documented at the bottom of this file.
+ * 2. Database: this spec and its global setup write real rows (employees,
+ *    shift templates, shifts, plus one admin row). Point `DATABASE_URL` at a
+ *    dev/scratch Postgres — DO NOT run against production. Cleanup is
+ *    documented at the bottom of this file.
  *
- * 3. Clerk testing-token mode: this spec assumes a Clerk dev/test instance is
- *    configured to accept the email/password below as a real admin login.
- *    See https://clerk.com/docs/testing/playwright/overview for the official
- *    setup. The two env vars used:
+ * 3. Clerk testing-token mode: `tests/e2e/global.setup.ts` runs first and:
+ *      - calls `clerkSetup()` against the project's Clerk dev instance
+ *        (requires `pk_test_*` / `sk_test_*` — refuses live keys)
+ *      - idempotently creates a Clerk user with the email/password below
+ *      - idempotently inserts a matching admin row (`admin_role = 'owner'`)
+ *    Each test then calls `setupClerkTestingToken({ page })` to bypass
+ *    Clerk's bot detection.
  *
- *      E2E_ADMIN_EMAIL     — defaults to "admin@test.local"
- *      E2E_ADMIN_PASSWORD  — defaults to "test-only"
+ *    Env vars (all optional — defaults are wired):
+ *      E2E_ADMIN_EMAIL     — default "admin+clerk_test@example.com"
+ *      E2E_ADMIN_PASSWORD  — default "E2E-Admin-Test-Pwd-1!"
  *
- *    The user identified by `E2E_ADMIN_EMAIL` must already exist in Clerk
- *    AND in our app's admin table (seed.ts creates three admins; map one of
- *    them to a Clerk test user, or add the test-mode user via Clerk dashboard).
- *
- *    Without this setup, the sign-in step will fail and the spec will time out.
- *    The spec file itself is well-formed and will be picked up by
- *    `pnpm test:e2e` regardless — runtime failure is purely an env issue.
+ *    Set explicit values in `.env.local` if you want different credentials;
+ *    do NOT commit them.
  *
  * --- How to run ---
  *
@@ -38,26 +38,35 @@
  *
  *   DELETE FROM employees WHERE email LIKE 'e2e-%@example.com';
  *
- * (Cascades remove their shift templates/shifts via FK.)
+ * (Cascades remove their shift templates/shifts via FK.) The single admin row
+ * created by global.setup.ts is idempotent and can be left in place.
  */
+import { setupClerkTestingToken } from "@clerk/testing/playwright";
 import { expect, test } from "@playwright/test";
+
+const ADMIN_EMAIL =
+  process.env.E2E_ADMIN_EMAIL ?? "admin+clerk_test@example.com";
+const ADMIN_PASSWORD =
+  process.env.E2E_ADMIN_PASSWORD ?? "E2E-Admin-Test-Pwd-1!";
 
 test.describe("admin-onboard-and-schedule", () => {
   test("sign in, add employee, add template, add override, print", async ({
     page,
   }) => {
+    await setupClerkTestingToken({ page });
+
     await page.goto("/sign-in");
-    // Clerk testing-token sign-in. Exact selectors depend on the Clerk
-    // component version; the spec uses role/label queries that should survive
-    // minor markup changes.
+    // Clerk's sign-in component renders social-provider buttons whose accessible
+    // names contain "Continue" (e.g. "Sign in with Google Continue"). Use the
+    // exact "Continue" label so we hit the form-submit button only.
+    await page.getByLabel(/email/i).fill(ADMIN_EMAIL);
+    await page.getByRole("button", { name: "Continue", exact: true }).click();
+    // "password" matches both the input AND a "Show password" toggle button —
+    // pin to the textbox role.
     await page
-      .getByLabel(/email/i)
-      .fill(process.env.E2E_ADMIN_EMAIL ?? "admin@test.local");
-    await page.getByRole("button", { name: /continue/i }).click();
-    await page
-      .getByLabel(/password/i)
-      .fill(process.env.E2E_ADMIN_PASSWORD ?? "test-only");
-    await page.getByRole("button", { name: /continue|sign in/i }).click();
+      .getByRole("textbox", { name: /password/i })
+      .fill(ADMIN_PASSWORD);
+    await page.getByRole("button", { name: "Continue", exact: true }).click();
 
     await page.waitForURL(/\/admin/);
 
