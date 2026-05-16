@@ -1,13 +1,14 @@
 import { notFound, redirect } from "next/navigation";
 import type { Route } from "next";
-import { eq } from "drizzle-orm";
+import { and, eq, gte, lte } from "drizzle-orm";
 import { requireAdmin } from "@/lib/auth";
 import { db } from "@/db/client";
-import { classes } from "@/db/schema";
+import { classes, enrollmentForecasts } from "@/db/schema";
 import {
   isISODateString,
   isMondayISODate,
   todayET,
+  weekEnd,
   weekStartOf,
 } from "@/lib/dates";
 import { resolveTemplateWeek, resolveWeek } from "@/lib/schedule/resolver";
@@ -41,6 +42,20 @@ export default async function ClassSchedulePage({
   const [cls] = await db.select().from(classes).where(eq(classes.id, classId));
   if (!cls) notFound();
 
+  const enrollmentRows = await db
+    .select()
+    .from(enrollmentForecasts)
+    .where(
+      and(
+        eq(enrollmentForecasts.classId, classId),
+        gte(enrollmentForecasts.date, weekStartISO),
+        lte(enrollmentForecasts.date, weekEnd(weekStartISO)),
+      ),
+    );
+  const enrollment = new Map<string, number>(
+    enrollmentRows.map((r) => [r.date, r.expectedStudents]),
+  );
+
   const shifts =
     mode === "template"
       ? await resolveTemplateWeek(classId, weekStartISO)
@@ -53,6 +68,7 @@ export default async function ClassSchedulePage({
       weekStartISO={weekStartISO}
       mode={mode}
       initialShifts={shifts}
+      enrollment={enrollment}
     />
   );
 }

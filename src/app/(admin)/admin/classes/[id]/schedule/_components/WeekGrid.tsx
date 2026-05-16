@@ -5,6 +5,7 @@ import type { DragEvent } from "react";
 import type { ResolvedShift, ScheduleMode } from "@/lib/schedule/types";
 import { addDaysISO } from "@/lib/dates";
 import type { DialogTarget } from "./ScheduleClient";
+import { EnrollmentRow } from "./EnrollmentRow";
 import { ShiftBlock } from "./ShiftBlock";
 
 const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
@@ -18,15 +19,19 @@ export type DragData = {
 };
 
 export function WeekGrid({
+  classId,
   weekStartISO,
   mode,
   shifts,
+  enrollment,
   onBlockClick,
   onMove,
 }: {
+  classId: string;
   weekStartISO: string;
   mode: ScheduleMode;
   shifts: ResolvedShift[];
+  enrollment: Map<string, number>;
   onBlockClick: (target: DialogTarget) => void;
   onMove: (data: DragData, targetDate: string) => Promise<void>;
 }) {
@@ -66,6 +71,13 @@ export function WeekGrid({
           </tr>
         </thead>
         <tbody>
+          {mode === "week" && (
+            <EnrollmentRow
+              classId={classId}
+              weekStartISO={weekStartISO}
+              enrollment={enrollment}
+            />
+          )}
           {employees.map((emp) => (
             <tr key={emp.id} className="border-t">
               <td className="px-3 py-2 align-top">

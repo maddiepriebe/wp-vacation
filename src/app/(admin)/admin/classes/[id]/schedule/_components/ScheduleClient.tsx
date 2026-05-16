@@ -32,12 +32,14 @@ export function ScheduleClient({
   weekStartISO,
   mode,
   initialShifts,
+  enrollment,
 }: {
   classId: string;
   className: string;
   weekStartISO: string;
   mode: ScheduleMode;
   initialShifts: ResolvedShift[];
+  enrollment: Map<string, number>;
 }) {
   const router = useRouter();
   const [dialog, setDialog] = useState<DialogTarget | null>(null);
@@ -85,9 +87,11 @@ export function ScheduleClient({
       </header>
 
       <WeekGrid
+        classId={classId}
         weekStartISO={weekStartISO}
         mode={mode}
         shifts={initialShifts}
+        enrollment={enrollment}
         onBlockClick={(t) =>
           setDialog(
             t.kind === "new-template"
