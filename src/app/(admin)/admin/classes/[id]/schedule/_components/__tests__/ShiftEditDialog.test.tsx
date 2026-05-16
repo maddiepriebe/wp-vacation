@@ -8,16 +8,16 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }),
 }));
 
-const createShiftMock = vi.fn(async () => ({
+const createShiftMock = vi.fn(async (_input: unknown) => ({
   ok: true as const,
   data: { id: "x" },
 }));
-const createTemplateMock = vi.fn(async () => ({
+const createTemplateMock = vi.fn(async (_input: unknown) => ({
   ok: true as const,
   data: { id: "x" },
 }));
 vi.mock("@/app/(admin)/admin/classes/[id]/actions", () => ({
-  createShiftAction: (...args: unknown[]) => createShiftMock(...args),
+  createShiftAction: (input: unknown) => createShiftMock(input),
   updateShiftAction: vi.fn(async () => ({
     ok: true as const,
     data: { id: "x" },
@@ -26,8 +26,7 @@ vi.mock("@/app/(admin)/admin/classes/[id]/actions", () => ({
     ok: true as const,
     data: { id: "x" },
   })),
-  createShiftTemplateAction: (...args: unknown[]) =>
-    createTemplateMock(...args),
+  createShiftTemplateAction: (input: unknown) => createTemplateMock(input),
   updateShiftTemplateAction: vi.fn(async () => ({
     ok: true as const,
     data: { id: "x" },
