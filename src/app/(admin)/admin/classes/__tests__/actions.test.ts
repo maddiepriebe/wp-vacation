@@ -1027,3 +1027,49 @@ describe("deleteEnrollmentForecastAction", () => {
     });
   });
 });
+
+import {
+  commitEnrollmentImportAction,
+} from "@/app/(admin)/admin/classes/[id]/actions";
+
+describe("commitEnrollmentImportAction", () => {
+  it("inserts rows and writes a summary audit (action='enrollment.import', targetId=classId)", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      const result = await commitEnrollmentImportAction({
+        classId: cls.id,
+        sessionId: "session-1",
+        rows: [
+          { date: "2026-05-18", expected_students: 18 },
+          { date: "2026-05-19", expected_students: 20 },
+        ],
+      });
+      expect(result.ok).toBe(true);
+      const rows = await tx.select().from(enrollmentForecasts).where(eq(enrollmentForecasts.classId, cls.id));
+      expect(rows).toHaveLength(2);
+      const [audit] = await tx.select().from(auditLog).where(eq(auditLog.action, "enrollment.import"));
+      expect(audit.entityId).toBe(cls.id);
+      expect(audit.payload).toMatchObject({ classId: cls.id, count: 2, sessionId: "session-1" });
+    });
+  });
+
+  it("updates existing rows on (classId, date) conflict", async () => {
+    await withTx(async (tx) => {
+      const admin = await makeAdmin(tx);
+      const cls = await makeClass(tx);
+      currentAdminId.value = admin.id;
+      await tx.insert(enrollmentForecasts).values({ classId: cls.id, date: "2026-05-18", expectedStudents: 5 });
+      const result = await commitEnrollmentImportAction({
+        classId: cls.id,
+        sessionId: "session-1",
+        rows: [{ date: "2026-05-18", expected_students: 30 }],
+      });
+      expect(result.ok).toBe(true);
+      const rows = await tx.select().from(enrollmentForecasts).where(eq(enrollmentForecasts.classId, cls.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0].expectedStudents).toBe(30);
+    });
+  });
+});

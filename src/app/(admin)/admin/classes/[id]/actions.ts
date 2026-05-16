@@ -1,6 +1,7 @@
 "use server";
 
 import { and, eq, gte, lte, ne, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { requireAdmin } from "@/lib/auth";
 import { runActionTx } from "@/lib/actions/transactions";
@@ -18,6 +19,7 @@ import { applyClosureRule, normTime } from "@/lib/schedule/closure";
 import { resolveWeek } from "@/lib/schedule/resolver";
 import { addDaysISO, todayET, weekEnd, weekStartOf } from "@/lib/dates";
 import {
+  commitEnrollmentImportInputSchema,
   copyWeekInputSchema,
   createShiftInputSchema,
   createShiftTemplateInputSchema,
@@ -30,6 +32,7 @@ import {
   updateShiftTemplateInputSchema,
   upsertEnrollmentForecastInputSchema,
 } from "@/lib/schedule/schemas";
+import { validateEnrollmentImportSheet } from "@/lib/sheets/enrollment-import";
 import type { TemplateLike, ShiftLike } from "@/lib/schedule/types";
 
 async function loadClassesEmployeesTemplatesForShift(
@@ -870,4 +873,60 @@ export async function deleteEnrollmentForecastAction(
     revalidatePath(`/admin/classes/${data.classId}/schedule`);
     return { ok: true, data: { classId: data.classId } };
   });
+}
+
+export async function parseEnrollmentImportAction(
+  fd: FormData,
+): Promise<ActionResult<{ sessionId: string; rows: ReturnType<typeof validateEnrollmentImportSheet>["rows"] }>> {
+  await requireAdmin();
+  const file = fd.get("file");
+  if (!(file instanceof File)) {
+    return { ok: false, error: { code: "validation", message: "Missing file" } };
+  }
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const { rows } = validateEnrollmentImportSheet(buffer);
+  return { ok: true, data: { sessionId: randomUUID(), rows } };
+}
+
+export async function commitEnrollmentImportAction(
+  input: unknown,
+): Promise<ActionResult<{ classId: string; count: number }>> {
+  const admin = await requireAdmin();
+  const parsed = commitEnrollmentImportInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: { code: "validation", message: "Invalid input", fieldErrors: parsed.error.flatten().fieldErrors },
+    };
+  }
+  const data = parsed.data;
+
+  return runActionTx(
+    "enrollment.import",
+    { classId: data.classId, sessionId: data.sessionId },
+    async (tx) => {
+      const [cls] = await tx.select({ id: classes.id }).from(classes).where(eq(classes.id, data.classId));
+      if (!cls) return { ok: false, error: { code: "class_missing", message: "Class not found" } };
+
+      for (const r of data.rows) {
+        await tx
+          .insert(enrollmentForecasts)
+          .values({ classId: data.classId, date: r.date, expectedStudents: r.expected_students })
+          .onConflictDoUpdate({
+            target: [enrollmentForecasts.classId, enrollmentForecasts.date],
+            set: { expectedStudents: r.expected_students, updatedAt: sql`now()` },
+          });
+      }
+
+      await writeAuditLog(tx, {
+        actorAdminId: admin.id,
+        action: "enrollment.import",
+        targetId: data.classId,
+        payload: { classId: data.classId, count: data.rows.length, sessionId: data.sessionId },
+      });
+
+      revalidatePath(`/admin/classes/${data.classId}/schedule`);
+      return { ok: true, data: { classId: data.classId, count: data.rows.length } };
+    },
+  );
 }
